@@ -1,0 +1,10 @@
+.env
+*.so
+*.o
+*.bc
+results/
+regression.diffs
+regression.out
+
+*.old*
+old/
