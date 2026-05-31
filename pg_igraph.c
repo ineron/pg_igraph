@@ -339,6 +339,39 @@ prepare_plans(void)
 }
 
 /* ================================================================
+ * Helper: build table name with prefix support
+ * ================================================================ */
+static char*
+build_table_name(const char *table_prefix, const char *table_name)
+{
+    if (!table_prefix || strlen(table_prefix) == 0)
+        return pstrdup(table_name);
+
+    /* Find dot separator */
+    char *dot_pos = strchr(table_prefix, '.');
+
+    if (dot_pos == NULL)
+    {
+        /* No dot - prefix is table name prefix, concatenate directly */
+        return psprintf("%s%s", table_prefix, table_name);
+    }
+    else
+    {
+        /* Has dot - split into schema and table prefix */
+        int schema_len = dot_pos - table_prefix;
+        char *schema_name = palloc(schema_len + 1);
+        strncpy(schema_name, table_prefix, schema_len);
+        schema_name[schema_len] = '\0';
+
+        char *table_prefix_part = dot_pos + 1; /* Skip the dot */
+
+        char *result = psprintf("\"%s\".\"%s%s\"", schema_name, table_prefix_part, table_name);
+        pfree(schema_name);
+        return result;
+    }
+}
+
+/* ================================================================
  * Helper: lookup or create a SMALLINT id by name
  * ================================================================ */
 static int16
@@ -370,72 +403,228 @@ lookup_or_create_id(SPIPlanPtr plan_lookup,
 }
 
 /* ================================================================
- * graph_add_node(label_name TEXT) → BIGINT
+ * graph_add_node_extended(label_name TEXT, table_prefix TEXT) → BIGINT
+ * Main implementation with table prefix support
  * ================================================================ */
-PG_FUNCTION_INFO_V1(graph_add_node);
-Datum graph_add_node(PG_FUNCTION_ARGS)
+PG_FUNCTION_INFO_V1(graph_add_node_extended);
+Datum graph_add_node_extended(PG_FUNCTION_ARGS)
 {
     text  *label_name = PG_GETARG_TEXT_PP(0);
+    text  *table_prefix_text = PG_GETARG_TEXT_PP(1);
     char  *label_str  = text_to_cstring(label_name);
+    char  *table_prefix = text_to_cstring(table_prefix_text);
+
+    char  *node_labels_table = build_table_name(table_prefix, "node_labels");
+    char  *nodes_table = build_table_name(table_prefix, "nodes");
+
     bool   isnull;
     int64  node_id;
+    int16  label_id;
+    int    ret;
 
     SPI_connect();
-    prepare_plans();
 
-    int16 label_id = lookup_or_create_id(
-        plan_get_label_id, plan_insert_label, label_str, "node_label");
+    /* First, get or create label_id */
+    StringInfoData get_label_query;
+    initStringInfo(&get_label_query);
+    appendStringInfo(&get_label_query,
+        "SELECT id FROM %s WHERE name = $1", node_labels_table);
 
-    Datum args[] = { Int16GetDatum(label_id) };
-    int ret = SPI_execute_plan(plan_insert_node, args, NULL, false, 1);
+    Oid get_label_types[] = { TEXTOID };
+    SPIPlanPtr get_label_plan = SPI_prepare(get_label_query.data, 1, get_label_types);
+    if (!get_label_plan)
+        elog(ERROR, "graph_add_node_extended: failed to prepare get_label plan");
+
+    Datum get_label_args[] = { CStringGetTextDatum(label_str) };
+    ret = SPI_execute_plan(get_label_plan, get_label_args, NULL, true, 1);
+
+    if (ret == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        /* Label exists, get its ID */
+        label_id = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[0],
+                                              SPI_tuptable->tupdesc, 1, &isnull));
+    }
+    else
+    {
+        /* Label doesn't exist, create it */
+        StringInfoData insert_label_query;
+        initStringInfo(&insert_label_query);
+        appendStringInfo(&insert_label_query,
+            "INSERT INTO %s (name) VALUES ($1) RETURNING id", node_labels_table);
+
+        Oid insert_label_types[] = { TEXTOID };
+        SPIPlanPtr insert_label_plan = SPI_prepare(insert_label_query.data, 1, insert_label_types);
+        if (!insert_label_plan)
+            elog(ERROR, "graph_add_node_extended: failed to prepare insert_label plan");
+
+        Datum insert_label_args[] = { CStringGetTextDatum(label_str) };
+        ret = SPI_execute_plan(insert_label_plan, insert_label_args, NULL, false, 1);
+
+        if (ret != SPI_OK_INSERT_RETURNING || SPI_processed == 0)
+            elog(ERROR, "graph_add_node_extended: failed to insert label");
+
+        label_id = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[0],
+                                              SPI_tuptable->tupdesc, 1, &isnull));
+    }
+
+    /* Now insert the node */
+    StringInfoData insert_node_query;
+    initStringInfo(&insert_node_query);
+    appendStringInfo(&insert_node_query,
+        "INSERT INTO %s (label) VALUES ($1) RETURNING id", nodes_table);
+
+    Oid insert_node_types[] = { INT2OID };
+    SPIPlanPtr insert_node_plan = SPI_prepare(insert_node_query.data, 1, insert_node_types);
+    if (!insert_node_plan)
+        elog(ERROR, "graph_add_node_extended: failed to prepare insert_node plan");
+
+    Datum insert_node_args[] = { Int16GetDatum(label_id) };
+    ret = SPI_execute_plan(insert_node_plan, insert_node_args, NULL, false, 1);
 
     if (ret != SPI_OK_INSERT_RETURNING || SPI_processed == 0)
-        elog(ERROR, "graph_add_node: failed to insert node");
+        elog(ERROR, "graph_add_node_extended: failed to insert node");
 
-    node_id = DatumGetInt64(
-        SPI_getbinval(SPI_tuptable->vals[0],
-                      SPI_tuptable->tupdesc, 1, &isnull));
+    node_id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+                                         SPI_tuptable->tupdesc, 1, &isnull));
 
     SPI_finish();
+
+    pfree(node_labels_table);
+    pfree(nodes_table);
+
     PG_RETURN_INT64(node_id);
 }
 
 /* ================================================================
- * graph_add_edge(from_id BIGINT, to_id BIGINT, rel_name TEXT) → VOID
- * Inserts forward + reverse edges atomically
+ * graph_add_node(label_name TEXT) → BIGINT
+ * Backward compatibility wrapper
  * ================================================================ */
-PG_FUNCTION_INFO_V1(graph_add_edge);
-Datum graph_add_edge(PG_FUNCTION_ARGS)
+PG_FUNCTION_INFO_V1(graph_add_node);
+Datum graph_add_node(PG_FUNCTION_ARGS)
+{
+    /* Call extended version with empty table prefix */
+    return DirectFunctionCall2(graph_add_node_extended,
+                              PG_GETARG_DATUM(0),
+                              CStringGetTextDatum(""));
+}
+
+/* ================================================================
+ * graph_add_edge_extended(from_id BIGINT, to_id BIGINT, rel_name TEXT, table_prefix TEXT) → VOID
+ * Main implementation with table prefix support
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_add_edge_extended);
+Datum graph_add_edge_extended(PG_FUNCTION_ARGS)
 {
     int64  from_id  = PG_GETARG_INT64(0);
     int64  to_id    = PG_GETARG_INT64(1);
     text  *rel_name = PG_GETARG_TEXT_PP(2);
+    text  *table_prefix_text = PG_GETARG_TEXT_PP(3);
     char  *rel_str  = text_to_cstring(rel_name);
+    char  *table_prefix = text_to_cstring(table_prefix_text);
+
+    char  *rel_types_table = build_table_name(table_prefix, "rel_types");
+    char  *edges_table = build_table_name(table_prefix, "edges");
+
+    bool   isnull;
+    int16  rel_id;
+    int    ret;
 
     SPI_connect();
-    prepare_plans();
 
-    int16 rel_id = lookup_or_create_id(
-        plan_get_rel_id, plan_insert_rel, rel_str, "rel_type");
+    /* First, get or create rel_type_id */
+    StringInfoData get_rel_query;
+    initStringInfo(&get_rel_query);
+    appendStringInfo(&get_rel_query,
+        "SELECT id FROM %s WHERE name = $1", rel_types_table);
+
+    Oid get_rel_types[] = { TEXTOID };
+    SPIPlanPtr get_rel_plan = SPI_prepare(get_rel_query.data, 1, get_rel_types);
+    if (!get_rel_plan)
+        elog(ERROR, "graph_add_edge_extended: failed to prepare get_rel plan");
+
+    Datum get_rel_args[] = { CStringGetTextDatum(rel_str) };
+    ret = SPI_execute_plan(get_rel_plan, get_rel_args, NULL, true, 1);
+
+    if (ret == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        /* Relation type exists, get its ID */
+        rel_id = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[0],
+                                            SPI_tuptable->tupdesc, 1, &isnull));
+    }
+    else
+    {
+        /* Relation type doesn't exist, create it */
+        StringInfoData insert_rel_query;
+        initStringInfo(&insert_rel_query);
+        appendStringInfo(&insert_rel_query,
+            "INSERT INTO %s (name) VALUES ($1) RETURNING id", rel_types_table);
+
+        Oid insert_rel_types[] = { TEXTOID };
+        SPIPlanPtr insert_rel_plan = SPI_prepare(insert_rel_query.data, 1, insert_rel_types);
+        if (!insert_rel_plan)
+            elog(ERROR, "graph_add_edge_extended: failed to prepare insert_rel plan");
+
+        Datum insert_rel_args[] = { CStringGetTextDatum(rel_str) };
+        ret = SPI_execute_plan(insert_rel_plan, insert_rel_args, NULL, false, 1);
+
+        if (ret != SPI_OK_INSERT_RETURNING || SPI_processed == 0)
+            elog(ERROR, "graph_add_edge_extended: failed to insert rel_type");
+
+        rel_id = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[0],
+                                            SPI_tuptable->tupdesc, 1, &isnull));
+    }
+
+    /* Insert forward edge */
+    StringInfoData insert_edge_query;
+    initStringInfo(&insert_edge_query);
+    appendStringInfo(&insert_edge_query,
+        "INSERT INTO %s (from_id, to_id, rel_type, direction) VALUES ($1, $2, $3, $4)",
+        edges_table);
+
+    Oid insert_edge_types[] = { INT8OID, INT8OID, INT2OID, BOOLOID };
+    SPIPlanPtr insert_edge_plan = SPI_prepare(insert_edge_query.data, 4, insert_edge_types);
+    if (!insert_edge_plan)
+        elog(ERROR, "graph_add_edge_extended: failed to prepare insert_edge plan");
 
     /* Forward edge */
     Datum fwd[] = {
         Int64GetDatum(from_id), Int64GetDatum(to_id),
         Int16GetDatum(rel_id),  BoolGetDatum(true)
     };
-    if (SPI_execute_plan(plan_insert_edge, fwd, NULL, false, 0) != SPI_OK_INSERT)
-        elog(ERROR, "graph_add_edge: failed to insert forward edge (SPI ret check)");
+    ret = SPI_execute_plan(insert_edge_plan, fwd, NULL, false, 0);
+    if (ret != SPI_OK_INSERT)
+        elog(ERROR, "graph_add_edge_extended: failed to insert forward edge");
 
     /* Reverse edge */
     Datum rev[] = {
         Int64GetDatum(to_id),   Int64GetDatum(from_id),
         Int16GetDatum(rel_id),  BoolGetDatum(false)
     };
-    if (SPI_execute_plan(plan_insert_edge, rev, NULL, false, 0) != SPI_OK_INSERT)
-        elog(ERROR, "graph_add_edge: failed to insert reverse edge (SPI ret check)");
+    ret = SPI_execute_plan(insert_edge_plan, rev, NULL, false, 0);
+    if (ret != SPI_OK_INSERT)
+        elog(ERROR, "graph_add_edge_extended: failed to insert reverse edge");
 
     SPI_finish();
+
+    pfree(rel_types_table);
+    pfree(edges_table);
+
     PG_RETURN_VOID();
+}
+
+/* ================================================================
+ * graph_add_edge(from_id BIGINT, to_id BIGINT, rel_name TEXT) → VOID
+ * Backward compatibility wrapper
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_add_edge);
+Datum graph_add_edge(PG_FUNCTION_ARGS)
+{
+    /* Call extended version with empty table prefix */
+    return DirectFunctionCall4(graph_add_edge_extended,
+                              PG_GETARG_DATUM(0),
+                              PG_GETARG_DATUM(1),
+                              PG_GETARG_DATUM(2),
+                              CStringGetTextDatum(""));
 }
 
 /* ================================================================
@@ -1562,7 +1751,7 @@ Datum graph_delete_node(PG_FUNCTION_ARGS)
  *                           in complex payload: [gmp_len:1b][GMP bytes]
  *   0x04 = timestamp/date   params = timezone offset (minutes from UTC)
  *   0x05 = bool             params = unused, payload = 1 byte
- *   0x07 = uuid             params = unused, payload = 16 bytes
+ *   0x08 = uuid             params = unused, payload = 16 bytes
  *   0x0E = complex type     params = complex_types.id (up to 4096 types)
  *   0x0F = hex/binary       params = byte count
  *
@@ -1575,7 +1764,7 @@ Datum graph_delete_node(PG_FUNCTION_ARGS)
 #define ILIB_OP_NUMERIC  0x02   /* numeric_to_bytea → op_id=0x02, params=scale */
 #define ILIB_OP_DATE     0x04   /* date_to_bytea → op_id=0x04, params=tz_offset */
 #define ILIB_OP_BOOL     0x05
-#define ILIB_OP_UUID     0x07
+#define ILIB_OP_UUID     0x08
 #define ILIB_OP_COMPLEX  0x0E
 #define ILIB_OP_HEX      0x0F
 
@@ -2316,4 +2505,828 @@ Datum graph_get_node_properties(PG_FUNCTION_ARGS)
 
     SPI_finish();
     PG_RETURN_POINTER(result);
+}
+
+/* ================================================================
+ * graph_resolve_ref
+ *
+ * Получает данные узла по REF ссылке.
+ * Ищет узел по UUID в свойстве ref_uuid с указанным ref_label.
+ *
+ * Usage:
+ *   SELECT graph_resolve_ref('550e8400-e29b-41d4-a716-446655440000'::uuid, 'User');
+ *   → { "id": 42, "label": "User", "properties": {...} }
+ *
+ * Параметры:
+ *   ref_uuid  — UUID ссылки
+ *   ref_type  — тип узла (ref_label)
+ *
+ * Возвращает: JSONB с данными узла или NULL если не найден
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_resolve_ref);
+Datum graph_resolve_ref(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+        PG_RETURN_NULL();
+
+    Datum ref_uuid = PG_GETARG_DATUM(0);  /* UUID */
+    text *ref_type = PG_GETARG_TEXT_PP(1); /* ref_label name */
+    char *ref_type_str = text_to_cstring(ref_type);
+
+    SPI_connect();
+    prepare_plans();
+
+    /* 1. Resolve ref_label name → ref_label_id */
+    Datum label_args[] = { CStringGetTextDatum(ref_type_str) };
+    int ret = SPI_execute_plan(plan_get_label_id, label_args, NULL, true, 1);
+
+    if (ret != SPI_OK_SELECT || SPI_processed == 0)
+    {
+        SPI_finish();
+        ereport(WARNING,
+            (errmsg("graph_resolve_ref: unknown ref_type '%s'", ref_type_str)));
+        PG_RETURN_NULL();
+    }
+
+    bool isnull;
+    int16 ref_label_id = DatumGetInt16(
+        SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+
+    /* 2. Find node with matching ref_uuid property */
+    const char *query =
+        "SELECT np.node_id, n.label "
+        "FROM node_properties np "
+        "JOIN nodes n ON n.id = np.node_id "
+        "JOIN property_types pt ON pt.id = np.prop_id "
+        "WHERE pt.name = 'ref_uuid' "
+        "  AND pt.primitive = 3 "  /* UUID type */
+        "  AND pt.ref_label = $1 "
+        "  AND np.value = $2";
+
+    /* Convert UUID to bytea for comparison */
+    bytea *uuid_bytea = DatumGetByteaPCopy(DirectFunctionCall1(uuid_send, ref_uuid));
+
+    Oid argtypes[] = { INT2OID, BYTEAOID };
+    Datum args[] = { Int16GetDatum(ref_label_id), PointerGetDatum(uuid_bytea) };
+
+    ret = SPI_execute_with_args(query, 2, argtypes, args, NULL, true, 1);
+
+    if (ret != SPI_OK_SELECT || SPI_processed == 0)
+    {
+        SPI_finish();
+        PG_RETURN_NULL();  /* REF not found */
+    }
+
+    /* 3. Extract node data */
+    int64 node_id = DatumGetInt64(
+        SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+    int16 label_id = DatumGetInt16(
+        SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+
+    SPI_finish();
+
+    /* 4. Build result JSON */
+    JsonbParseState *state = NULL;
+    JsonbValue jv, *result_jv;
+
+    pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+
+    /* Add node_id */
+    jv.type = jbvString;
+    jv.val.string.val = "id";
+    jv.val.string.len = 2;
+    pushJsonbValue(&state, WJB_KEY, &jv);
+    jv.type = jbvNumeric;
+    jv.val.numeric = DatumGetNumeric(DirectFunctionCall1(int8_numeric, Int64GetDatum(node_id)));
+    pushJsonbValue(&state, WJB_VALUE, &jv);
+
+    /* Add ref_type */
+    jv.type = jbvString;
+    jv.val.string.val = "type";
+    jv.val.string.len = 4;
+    pushJsonbValue(&state, WJB_KEY, &jv);
+    jv.val.string.val = ref_type_str;
+    jv.val.string.len = strlen(ref_type_str);
+    pushJsonbValue(&state, WJB_VALUE, &jv);
+
+    result_jv = pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+    Jsonb *result = JsonbValueToJsonb(result_jv);
+
+    PG_RETURN_POINTER(result);
+}
+
+/* Forward declarations for Ledgyx integration functions */
+static bytea *pack_ref_data_for_ledgyx(Datum ref_uuid, const char *ref_type);
+static Jsonb *call_ledgyx_resolver(const char *resolver_func, bytea *ref_data, ArrayType *fields);
+
+/* ================================================================
+ * graph_resolve_ref_with_resolver
+ *
+ * Получает данные REF ссылки через внешний Ledgyx резолвер.
+ * Вызывает указанную функцию-резолвер на стороне Ledgyx с упакованными данными.
+ *
+ * Usage:
+ *   SELECT graph_resolve_ref('550e8400-e29b-41d4-a716-446655440000'::uuid, 'User', 'ledgyx_user_resolver');
+ *   → вызывает ledgyx_user_resolver(ref_data bytea, fields text[]) → JSONB
+ *
+ * Параметры:
+ *   ref_uuid      — UUID ссылки
+ *   ref_type      — тип узла (ref_label)
+ *   resolver_func — имя функции-резолвера на стороне Ledgyx
+ *
+ * Функция-резолвер должна принимать:
+ *   ref_data BYTEA  — упакованные данные (UUID + ref_type + дополнительные поля)
+ *   fields TEXT[]   — список полей для чтения (если NULL - читать все)
+ *
+ * Возвращает: JSONB с данными из Ledgyx или NULL если резолвер не найден
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_resolve_ref_with_resolver);
+Datum graph_resolve_ref_with_resolver(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+        PG_RETURN_NULL();
+
+    Datum ref_uuid = PG_GETARG_DATUM(0);  /* UUID */
+    text *ref_type = PG_GETARG_TEXT_PP(1); /* ref_label name */
+    text *resolver_func = PG_GETARG_TEXT_PP(2); /* Ledgyx resolver function name */
+
+    char *ref_type_str = text_to_cstring(ref_type);
+    char *resolver_func_str = text_to_cstring(resolver_func);
+
+    SPI_connect();
+
+    /* 1. Упаковываем данные для передачи в резолвер */
+    bytea *ref_data = pack_ref_data_for_ledgyx(ref_uuid, ref_type_str);
+
+    /* 2. Вызываем внешнюю функцию-резолвер */
+    Jsonb *result = call_ledgyx_resolver(resolver_func_str, ref_data, NULL);
+
+    SPI_finish();
+
+    if (result == NULL)
+        PG_RETURN_NULL();
+
+    PG_RETURN_POINTER(result);
+}
+
+/* ================================================================
+ * pack_ref_data_for_ledgyx
+ *
+ * Упаковывает REF данные в bytea для передачи в Ledgyx резолвер.
+ * Формат: [UUID_16_bytes][ref_type_length_4_bytes][ref_type_string]
+ * ================================================================ */
+static bytea *pack_ref_data_for_ledgyx(Datum ref_uuid, const char *ref_type)
+{
+    /* Convert UUID to binary */
+    bytea *uuid_bytea = DatumGetByteaPCopy(DirectFunctionCall1(uuid_send, ref_uuid));
+    int uuid_len = VARSIZE(uuid_bytea) - VARHDRSZ; /* Should be 16 bytes */
+
+    /* Calculate total size */
+    int ref_type_len = strlen(ref_type);
+    int total_size = VARHDRSZ + uuid_len + sizeof(int32) + ref_type_len;
+
+    /* Allocate and build result */
+    bytea *result = (bytea *) palloc(total_size);
+    SET_VARSIZE(result, total_size);
+
+    char *ptr = VARDATA(result);
+
+    /* Copy UUID (16 bytes) */
+    memcpy(ptr, VARDATA(uuid_bytea), uuid_len);
+    ptr += uuid_len;
+
+    /* Copy ref_type length (4 bytes) */
+    int32 type_len_be = htonl(ref_type_len);
+    memcpy(ptr, &type_len_be, sizeof(int32));
+    ptr += sizeof(int32);
+
+    /* Copy ref_type string */
+    memcpy(ptr, ref_type, ref_type_len);
+
+    return result;
+}
+
+/* ================================================================
+ * call_ledgyx_resolver
+ *
+ * Вызывает указанную функцию-резолвер через SPI.
+ * Функция должна иметь сигнатуру: func_name(ref_data BYTEA, fields TEXT[]) → JSONB
+ * ================================================================ */
+static Jsonb *call_ledgyx_resolver(const char *resolver_func, bytea *ref_data, ArrayType *fields)
+{
+    char query[256];
+    snprintf(query, sizeof(query), "SELECT %s($1, $2)", resolver_func);
+
+    /* Prepare arguments */
+    Oid argtypes[] = { BYTEAOID, TEXTARRAYOID };
+    Datum args[] = {
+        PointerGetDatum(ref_data),
+        fields ? PointerGetDatum(fields) : (Datum) 0
+    };
+    char nulls[] = {
+        ' ',  /* ref_data - not null */
+        fields ? ' ' : 'n'  /* fields - nullable */
+    };
+
+    int ret = SPI_execute_with_args(query, 2, argtypes, args, nulls, true, 1);
+
+    if (ret != SPI_OK_SELECT || SPI_processed == 0)
+    {
+        ereport(WARNING,
+            (errmsg("graph_resolve_ref_with_resolver: failed to call resolver function '%s'", resolver_func)));
+        return NULL;
+    }
+
+    bool isnull;
+    Datum result_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+    if (isnull)
+        return NULL;
+
+    return DatumGetJsonbP(result_datum);
+}
+
+/* ================================================================
+ * graph_resolve_node
+ *
+ * RESOLVE функциональность из Ledgyx SQL:
+ * Найти узел по natural key, создать если отсутствует.
+ *
+ * Usage:
+ *   SELECT graph_resolve_node('Category', 'name', 'Молочные', true);
+ *   → возвращает node_id (найденный или созданный)
+ *
+ * Параметры:
+ *   label_name     — тип узла (Category)
+ *   lookup_prop    — свойство для поиска (name)
+ *   lookup_value   — значение для поиска (Молочные)
+ *   create_missing — создать если не найден (true = RESOLVE, false = LOOKUP)
+ *
+ * Возвращает: BIGINT node_id
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_resolve_node);
+Datum graph_resolve_node(PG_FUNCTION_ARGS)
+{
+    text *label_name = PG_GETARG_TEXT_PP(0);
+    text *lookup_prop = PG_GETARG_TEXT_PP(1);
+    text *lookup_value = PG_GETARG_TEXT_PP(2);
+    bool create_missing = PG_GETARG_BOOL(3);
+
+    char *label_str = text_to_cstring(label_name);
+    char *prop_str = text_to_cstring(lookup_prop);
+    char *value_str = text_to_cstring(lookup_value);
+
+    SPI_connect();
+    prepare_plans();
+
+    /* 1. Get label_id for the node type */
+    Datum label_args[] = { CStringGetTextDatum(label_str) };
+    int ret = SPI_execute_plan(plan_get_label_id, label_args, NULL, true, 1);
+
+    if (ret != SPI_OK_SELECT || SPI_processed == 0)
+    {
+        SPI_finish();
+        ereport(ERROR,
+            (errcode(ERRCODE_UNDEFINED_OBJECT),
+             errmsg("graph_resolve_node: unknown label '%s'", label_str)));
+    }
+
+    bool isnull;
+    int16 label_id = DatumGetInt16(
+        SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+
+    /* 2. Search for existing node with this property value */
+    const char *search_query =
+        "SELECT n.id "
+        "FROM nodes n "
+        "JOIN node_properties np ON np.node_id = n.id "
+        "JOIN property_types pt ON pt.id = np.prop_id "
+        "WHERE n.label = $1 "
+        "  AND pt.name = $2 "
+        "  AND np.value = $3 "
+        "LIMIT 1";
+
+    /* Convert text value to bytea (as text type) */
+    bytea *value_bytea = (bytea *) palloc(VARHDRSZ + 2 + strlen(value_str));
+    SET_VARSIZE(value_bytea, VARHDRSZ + 2 + strlen(value_str));
+    unsigned char *data = (unsigned char *) VARDATA(value_bytea);
+    data[0] = 1;  /* ILIB_OP_TEXT */
+    data[1] = 0;  /* params = 0 */
+    memcpy(data + 2, value_str, strlen(value_str));
+
+    Oid search_argtypes[] = { INT2OID, TEXTOID, BYTEAOID };
+    Datum search_args[] = {
+        Int16GetDatum(label_id),
+        PointerGetDatum(lookup_prop),
+        PointerGetDatum(value_bytea)
+    };
+
+    ret = SPI_execute_with_args(search_query, 3, search_argtypes, search_args,
+                                NULL, true, 1);
+
+    if (ret == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        /* Found existing node */
+        int64 node_id = DatumGetInt64(
+            SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+        SPI_finish();
+        PG_RETURN_INT64(node_id);
+    }
+
+    /* 3. Node not found - create if requested */
+    if (!create_missing)
+    {
+        SPI_finish();
+        ereport(ERROR,
+            (errcode(ERRCODE_NO_DATA_FOUND),
+             errmsg("graph_resolve_node: node with %s='%s' not found",
+                    prop_str, value_str)));
+    }
+
+    /* 4. Create new node */
+    ret = SPI_execute_plan(plan_insert_node, label_args, NULL, false, 1);
+    if (ret != SPI_OK_SELECT)
+    {
+        SPI_finish();
+        ereport(ERROR,
+            (errcode(ERRCODE_INTERNAL_ERROR),
+             errmsg("graph_resolve_node: failed to create node")));
+    }
+
+    int64 new_node_id = DatumGetInt64(
+        SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+
+    /* 5. Set the lookup property on the new node */
+    Oid prop_argtypes[] = { INT8OID, TEXTOID, INT2OID, BYTEAOID };
+    Datum prop_args[] = {
+        Int64GetDatum(new_node_id),
+        PointerGetDatum(lookup_prop),
+        Int16GetDatum(1),  /* text primitive type */
+        PointerGetDatum(value_bytea)
+    };
+
+    ret = SPI_execute_with_args(
+        "SELECT graph_set_property($1, $2, $3, $4)",
+        4, prop_argtypes, prop_args, NULL, false, 1);
+
+    SPI_finish();
+    PG_RETURN_INT64(new_node_id);
+}
+
+/* ================================================================
+ * graph_expand_refs
+ *
+ * Массово раскрывает REF ссылки в узлах, возвращая полные данные.
+ * Принимает массив node_id, возвращает JSONB с раскрытыми ссылками.
+ *
+ * Usage:
+ *   SELECT graph_expand_refs(ARRAY[42, 99, 123]);
+ *   → { "42": { "refs": { "owner": { "id": 1, "name": "Alice" } } } }
+ *
+ * Параметры:
+ *   node_ids — массив BIGINT node ID для обработки
+ *
+ * Возвращает: JSONB со всеми раскрытыми ссылками
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_expand_refs);
+Datum graph_expand_refs(PG_FUNCTION_ARGS)
+{
+    ArrayType *node_array = PG_GETARG_ARRAYTYPE_P(0);
+    Datum *node_ids;
+    bool  *nulls;
+    int    n_nodes;
+
+    /* Extract node IDs from array */
+    deconstruct_array(node_array, INT8OID, 8, true, 'd', &node_ids, &nulls, &n_nodes);
+
+    if (n_nodes == 0)
+        PG_RETURN_NULL();
+
+    SPI_connect();
+
+    JsonbParseState *state = NULL;
+    JsonbValue jv;
+
+    pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+
+    /* Process each node */
+    for (int i = 0; i < n_nodes; i++)
+    {
+        if (nulls[i]) continue;
+
+        int64 node_id = DatumGetInt64(node_ids[i]);
+
+        /* Find all REF properties for this node */
+        const char *ref_query =
+            "SELECT pt.name, pt.ref_label, np.value, nl.name as ref_type_name "
+            "FROM node_properties np "
+            "JOIN property_types pt ON pt.id = np.prop_id "
+            "LEFT JOIN node_labels nl ON nl.id = pt.ref_label "
+            "WHERE np.node_id = $1 "
+            "  AND pt.primitive = 3 "  /* UUID type */
+            "  AND pt.ref_label IS NOT NULL";  /* Has REF */
+
+        Oid argtypes[] = { INT8OID };
+        Datum args[] = { Int64GetDatum(node_id) };
+
+        int ret = SPI_execute_with_args(ref_query, 1, argtypes, args, NULL, true, 0);
+
+        if (ret == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            /* Add node_id as key */
+            char node_key[32];
+            snprintf(node_key, sizeof(node_key), "%ld", node_id);
+            jv.type = jbvString;
+            jv.val.string.val = node_key;
+            jv.val.string.len = strlen(node_key);
+            pushJsonbValue(&state, WJB_KEY, &jv);
+
+            /* Begin node object */
+            pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+
+            /* Add refs object */
+            jv.val.string.val = "refs";
+            jv.val.string.len = 4;
+            pushJsonbValue(&state, WJB_KEY, &jv);
+            pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+
+            /* Process each REF property */
+            for (uint64 j = 0; j < SPI_processed; j++)
+            {
+                bool isnull;
+                TupleDesc td = SPI_tuptable->tupdesc;
+                HeapTuple ht = SPI_tuptable->vals[j];
+
+                char *prop_name = TextDatumGetCString(
+                    SPI_getbinval(ht, td, 1, &isnull));
+                char *ref_type_name = TextDatumGetCString(
+                    SPI_getbinval(ht, td, 4, &isnull));
+
+                /* Add property name as key */
+                jv.val.string.val = prop_name;
+                jv.val.string.len = strlen(prop_name);
+                pushJsonbValue(&state, WJB_KEY, &jv);
+
+                /* For now, add placeholder - in real implementation
+                 * would call graph_resolve_ref recursively */
+                pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+                jv.val.string.val = "type";
+                jv.val.string.len = 4;
+                pushJsonbValue(&state, WJB_KEY, &jv);
+                jv.val.string.val = ref_type_name;
+                jv.val.string.len = strlen(ref_type_name);
+                pushJsonbValue(&state, WJB_VALUE, &jv);
+                pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+            }
+
+            pushJsonbValue(&state, WJB_END_OBJECT, NULL); /* End refs */
+            pushJsonbValue(&state, WJB_END_OBJECT, NULL); /* End node */
+        }
+    }
+
+    JsonbValue *result_jv = pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+    Jsonb *result = JsonbValueToJsonb(result_jv);
+
+    SPI_finish();
+    PG_RETURN_POINTER(result);
+}
+
+/* ================================================================
+ * graph_lookup_node
+ *
+ * LOOKUP версия graph_resolve_node (не создает, только ищет).
+ *
+ * Usage:
+ *   SELECT graph_lookup_node('Category', 'name', 'Молочные');
+ *   → возвращает node_id или NULL
+ *
+ * Параметры: как у graph_resolve_node, но всегда create_missing=false
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_lookup_node);
+Datum graph_lookup_node(PG_FUNCTION_ARGS)
+{
+    /* Wrapper around graph_resolve_node with create_missing=false */
+    return DirectFunctionCall4(graph_resolve_node,
+                               PG_GETARG_DATUM(0),  /* label_name */
+                               PG_GETARG_DATUM(1),  /* lookup_prop */
+                               PG_GETARG_DATUM(2),  /* lookup_value */
+                               BoolGetDatum(false)); /* create_missing=false */
+}
+/* ================================================================
+ * graph_delete_node_extended(node_id BIGINT, table_prefix TEXT) → VOID
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_delete_node_extended);
+Datum graph_delete_node_extended(PG_FUNCTION_ARGS)
+{
+    int64 node_id = PG_GETARG_INT64(0);
+    text  *table_prefix_text = PG_GETARG_TEXT_PP(1);
+    char  *table_prefix = text_to_cstring(table_prefix_text);
+
+    char  *edges_table = build_table_name(table_prefix, "edges");
+    char  *nodes_table = build_table_name(table_prefix, "nodes");
+
+    int   ret;
+
+    SPI_connect();
+
+    /* Delete all edges where this node is involved */
+    StringInfoData delete_edges_query;
+    initStringInfo(&delete_edges_query);
+    appendStringInfo(&delete_edges_query,
+        "DELETE FROM %s WHERE from_id = $1 OR to_id = $1", edges_table);
+
+    Oid delete_edges_types[] = { INT8OID };
+    SPIPlanPtr delete_edges_plan = SPI_prepare(delete_edges_query.data, 1, delete_edges_types);
+    if (!delete_edges_plan)
+        elog(ERROR, "graph_delete_node_extended: failed to prepare delete_edges plan");
+
+    Datum delete_edges_args[] = { Int64GetDatum(node_id) };
+    ret = SPI_execute_plan(delete_edges_plan, delete_edges_args, NULL, false, 0);
+    if (ret != SPI_OK_DELETE)
+        elog(ERROR, "graph_delete_node_extended: failed to delete node edges");
+
+    /* Delete the node */
+    StringInfoData delete_node_query;
+    initStringInfo(&delete_node_query);
+    appendStringInfo(&delete_node_query,
+        "DELETE FROM %s WHERE id = $1", nodes_table);
+
+    Oid delete_node_types[] = { INT8OID };
+    SPIPlanPtr delete_node_plan = SPI_prepare(delete_node_query.data, 1, delete_node_types);
+    if (!delete_node_plan)
+        elog(ERROR, "graph_delete_node_extended: failed to prepare delete_node plan");
+
+    Datum delete_node_args[] = { Int64GetDatum(node_id) };
+    ret = SPI_execute_plan(delete_node_plan, delete_node_args, NULL, false, 0);
+    if (ret != SPI_OK_DELETE)
+        elog(ERROR, "graph_delete_node_extended: failed to delete node");
+
+    SPI_finish();
+
+    pfree(edges_table);
+    pfree(nodes_table);
+
+    PG_RETURN_VOID();
+}
+
+/* ================================================================
+ * graph_set_property_extended(node_id BIGINT, prop_name TEXT, primitive SMALLINT, value BYTEA, ref_label TEXT, table_prefix TEXT) → VOID
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_set_property_extended);
+Datum graph_set_property_extended(PG_FUNCTION_ARGS)
+{
+    int64  node_id = PG_GETARG_INT64(0);
+    text  *prop_name = PG_GETARG_TEXT_PP(1);
+    int16  primitive = PG_GETARG_INT16(2);
+    bytea *value = PG_GETARG_BYTEA_PP(3);
+    text  *ref_label = PG_ARGISNULL(4) ? NULL : PG_GETARG_TEXT_PP(4);
+    text  *table_prefix_text = PG_GETARG_TEXT_PP(5);
+
+    char  *prop_str = text_to_cstring(prop_name);
+    char  *table_prefix = text_to_cstring(table_prefix_text);
+    char  *ref_str = ref_label ? text_to_cstring(ref_label) : NULL;
+
+    char  *property_types_table = build_table_name(table_prefix, "property_types");
+    char  *node_properties_table = build_table_name(table_prefix, "node_properties");
+
+    bool   isnull;
+    int16  prop_id;
+    int    ret;
+
+    SPI_connect();
+
+    /* First, get or create property type */
+    StringInfoData get_prop_query;
+    initStringInfo(&get_prop_query);
+    appendStringInfo(&get_prop_query,
+        "SELECT id FROM %s WHERE name = $1", property_types_table);
+
+    Oid get_prop_types[] = { TEXTOID };
+    SPIPlanPtr get_prop_plan = SPI_prepare(get_prop_query.data, 1, get_prop_types);
+    if (!get_prop_plan)
+        elog(ERROR, "graph_set_property_extended: failed to prepare get_prop plan");
+
+    Datum get_prop_args[] = { CStringGetTextDatum(prop_str) };
+    ret = SPI_execute_plan(get_prop_plan, get_prop_args, NULL, true, 1);
+
+    if (ret == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        /* Property type exists, get its ID */
+        prop_id = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[0],
+                                              SPI_tuptable->tupdesc, 1, &isnull));
+    }
+    else
+    {
+        /* Property type doesn't exist, create it */
+        StringInfoData insert_prop_query;
+        initStringInfo(&insert_prop_query);
+        if (ref_str) {
+            appendStringInfo(&insert_prop_query,
+                "INSERT INTO %s (name, primitive, ref_label) VALUES ($1, $2, (SELECT id FROM %s WHERE name = $3)) RETURNING id",
+                property_types_table, build_table_name(table_prefix, "node_labels"));
+
+            Oid insert_prop_types[] = { TEXTOID, INT2OID, TEXTOID };
+            SPIPlanPtr insert_prop_plan = SPI_prepare(insert_prop_query.data, 3, insert_prop_types);
+            if (!insert_prop_plan)
+                elog(ERROR, "graph_set_property_extended: failed to prepare insert_prop plan");
+
+            Datum insert_prop_args[] = { CStringGetTextDatum(prop_str), Int16GetDatum(primitive), CStringGetTextDatum(ref_str) };
+            ret = SPI_execute_plan(insert_prop_plan, insert_prop_args, NULL, false, 1);
+        }
+        else {
+            appendStringInfo(&insert_prop_query,
+                "INSERT INTO %s (name, primitive) VALUES ($1, $2) RETURNING id", property_types_table);
+
+            Oid insert_prop_types[] = { TEXTOID, INT2OID };
+            SPIPlanPtr insert_prop_plan = SPI_prepare(insert_prop_query.data, 2, insert_prop_types);
+            if (!insert_prop_plan)
+                elog(ERROR, "graph_set_property_extended: failed to prepare insert_prop plan");
+
+            Datum insert_prop_args[] = { CStringGetTextDatum(prop_str), Int16GetDatum(primitive) };
+            ret = SPI_execute_plan(insert_prop_plan, insert_prop_args, NULL, false, 1);
+        }
+
+        if (ret != SPI_OK_INSERT_RETURNING || SPI_processed == 0)
+            elog(ERROR, "graph_set_property_extended: failed to insert property type");
+
+        prop_id = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[0],
+                                              SPI_tuptable->tupdesc, 1, &isnull));
+    }
+
+    /* Now insert or update the property value */
+    StringInfoData upsert_value_query;
+    initStringInfo(&upsert_value_query);
+    appendStringInfo(&upsert_value_query,
+        "INSERT INTO %s (node_id, prop_id, value) VALUES ($1, $2, $3) "
+        "ON CONFLICT (node_id, prop_id) DO UPDATE SET value = EXCLUDED.value",
+        node_properties_table);
+
+    Oid upsert_value_types[] = { INT8OID, INT2OID, BYTEAOID };
+    SPIPlanPtr upsert_value_plan = SPI_prepare(upsert_value_query.data, 3, upsert_value_types);
+    if (!upsert_value_plan)
+        elog(ERROR, "graph_set_property_extended: failed to prepare upsert_value plan");
+
+    Datum upsert_value_args[] = { Int64GetDatum(node_id), Int16GetDatum(prop_id), PointerGetDatum(value) };
+    ret = SPI_execute_plan(upsert_value_plan, upsert_value_args, NULL, false, 1);
+
+    if (ret != SPI_OK_INSERT)
+        elog(ERROR, "graph_set_property_extended: failed to upsert property value");
+
+    SPI_finish();
+
+    pfree(property_types_table);
+    pfree(node_properties_table);
+
+    PG_RETURN_VOID();
+}
+
+/* ================================================================
+ * graph_get_property_extended(node_id BIGINT, prop_name TEXT, table_prefix TEXT) → BYTEA
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_get_property_extended);
+Datum graph_get_property_extended(PG_FUNCTION_ARGS)
+{
+    int64  node_id = PG_GETARG_INT64(0);
+    text  *prop_name = PG_GETARG_TEXT_PP(1);
+    text  *table_prefix_text = PG_GETARG_TEXT_PP(2);
+
+    char  *prop_str = text_to_cstring(prop_name);
+    char  *table_prefix = text_to_cstring(table_prefix_text);
+
+    char  *property_types_table = build_table_name(table_prefix, "property_types");
+    char  *node_properties_table = build_table_name(table_prefix, "node_properties");
+
+    bool   isnull;
+    int    ret;
+
+    SPI_connect();
+
+    /* Get property value */
+    StringInfoData get_value_query;
+    initStringInfo(&get_value_query);
+    appendStringInfo(&get_value_query,
+        "SELECT np.value FROM %s np "
+        "JOIN %s pt ON np.prop_id = pt.id "
+        "WHERE np.node_id = $1 AND pt.name = $2",
+        node_properties_table, property_types_table);
+
+    Oid get_value_types[] = { INT8OID, TEXTOID };
+    SPIPlanPtr get_value_plan = SPI_prepare(get_value_query.data, 2, get_value_types);
+    if (!get_value_plan)
+        elog(ERROR, "graph_get_property_extended: failed to prepare get_value plan");
+
+    Datum get_value_args[] = { Int64GetDatum(node_id), CStringGetTextDatum(prop_str) };
+    ret = SPI_execute_plan(get_value_plan, get_value_args, NULL, true, 1);
+
+    if (ret != SPI_OK_SELECT || SPI_processed == 0)
+    {
+        SPI_finish();
+        pfree(property_types_table);
+        pfree(node_properties_table);
+        PG_RETURN_NULL();
+    }
+
+    Datum val = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+    if (isnull) {
+        SPI_finish();
+        pfree(property_types_table);
+        pfree(node_properties_table);
+        PG_RETURN_NULL();
+    }
+
+    bytea *result = DatumGetByteaPCopy(val);
+
+    SPI_finish();
+    pfree(property_types_table);
+    pfree(node_properties_table);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/* ================================================================
+ * graph_get_node_properties_extended(node_id BIGINT, table_prefix TEXT) → JSONB
+ * ================================================================ */
+PG_FUNCTION_INFO_V1(graph_get_node_properties_extended);
+Datum graph_get_node_properties_extended(PG_FUNCTION_ARGS)
+{
+    int64  node_id = PG_GETARG_INT64(0);
+    text  *table_prefix_text = PG_GETARG_TEXT_PP(1);
+
+    char  *table_prefix = text_to_cstring(table_prefix_text);
+
+    char  *property_types_table = build_table_name(table_prefix, "property_types");
+    char  *node_properties_table = build_table_name(table_prefix, "node_properties");
+
+    int    ret;
+
+    SPI_connect();
+
+    /* Get all properties for the node */
+    StringInfoData get_props_query;
+    initStringInfo(&get_props_query);
+    appendStringInfo(&get_props_query,
+        "SELECT pt.name, np.value FROM %s np "
+        "JOIN %s pt ON np.prop_id = pt.id "
+        "WHERE np.node_id = $1 ORDER BY pt.name",
+        node_properties_table, property_types_table);
+
+    Oid get_props_types[] = { INT8OID };
+    SPIPlanPtr get_props_plan = SPI_prepare(get_props_query.data, 1, get_props_types);
+    if (!get_props_plan)
+        elog(ERROR, "graph_get_node_properties_extended: failed to prepare get_props plan");
+
+    Datum get_props_args[] = { Int64GetDatum(node_id) };
+    ret = SPI_execute_plan(get_props_plan, get_props_args, NULL, true, 0);
+
+    if (ret != SPI_OK_SELECT) {
+        SPI_finish();
+        pfree(property_types_table);
+        pfree(node_properties_table);
+        elog(ERROR, "graph_get_node_properties_extended: failed to execute query");
+    }
+
+    JsonbParseState *state = NULL;
+    JsonbValue jb_val;
+
+    jb_val.type = jbvObject;
+    pushJsonbValue(&state, WJB_BEGIN_OBJECT, &jb_val);
+
+    uint64 nrows = SPI_processed;
+    for (uint64 i = 0; i < nrows; i++)
+    {
+        bool isnull;
+        Datum d_name = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
+        Datum d_val = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull);
+
+        if (!isnull) {
+            char *prop_name = TextDatumGetCString(d_name);
+            bytea *bv = DatumGetByteaPCopy(d_val);
+
+            /* Simple decoding for basic types - just treat as text for now */
+            char *str_value = (char *) VARDATA(bv);
+            size_t str_len = VARSIZE(bv) - VARHDRSZ;
+
+            JsonbValue key_jb;
+            key_jb.type = jbvString;
+            key_jb.val.string.len = strlen(prop_name);
+            key_jb.val.string.val = prop_name;
+            pushJsonbValue(&state, WJB_KEY, &key_jb);
+
+            JsonbValue val_jb;
+            val_jb.type = jbvString;
+            val_jb.val.string.len = str_len;
+            val_jb.val.string.val = str_value;
+            pushJsonbValue(&state, WJB_VALUE, &val_jb);
+        }
+    }
+
+    JsonbValue *result_jv = pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+    Jsonb *result = JsonbValueToJsonb(result_jv);
+
+    SPI_finish();
+    pfree(property_types_table);
+    pfree(node_properties_table);
+
+    PG_RETURN_JSONB_P(result);
 }

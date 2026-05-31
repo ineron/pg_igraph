@@ -16,7 +16,18 @@ typedef struct IgraphParseState {
     const char *input;      /* original query string            */
     int         col;        /* current column (for errors)      */
     void       *result;     /* IgraphStmt* set by parser        */
+    /* Extended context for table prefixes and JSON parameters */
+    const char *table_prefix; /* table prefix for multi-graph support */
+    Jsonb      *json_params;  /* parsed JSON parameters */
 } IgraphParseState;
+
+/* ================================================================
+ * Execution context — passed to executor functions
+ * ================================================================ */
+typedef struct IgraphExecContext {
+    const char *table_prefix; /* table prefix for dynamic table names */
+    Jsonb      *json_params;  /* JSON parameters for &data.field substitution */
+} IgraphExecContext;
 
 /* ================================================================
  * AST node types
@@ -39,10 +50,29 @@ typedef enum IgraphDir {
     DIR_BOTH,               /* (a)-[:R]-(b)   undirected        */
 } IgraphDir;
 
-/* A single node pattern: (alias:Label) */
+/* Value types for AST nodes */
+typedef enum IgraphValType {
+    IGRAPH_VAL_INT, IGRAPH_VAL_FLOAT, IGRAPH_VAL_STRING, IGRAPH_VAL_BOOL, IGRAPH_VAL_NULL, IGRAPH_VAL_PARAM
+} IgraphValType;
+
+typedef struct IgraphValue {
+    IgraphValType type;
+    union {
+        int64       ival;
+        double      fval;
+        char       *sval;
+        bool        bval;
+        char       *param_path; /* JSON parameter path like "data.threshold" */
+    };
+} IgraphValue;
+
+/* A single node pattern: (alias:Label) or (alias:Label REF Type = value) */
 typedef struct IgraphNodePat {
     char *alias;            /* variable name, e.g. "n"          */
     char *label;            /* node label, e.g. "Product"       */
+    char *ref_type;         /* REF target type, e.g. "User"     */
+    IgraphValue ref_value;  /* REF value (UUID or param)        */
+    bool  has_ref;          /* true if REF specified            */
 } IgraphNodePat;
 
 /* A relationship pattern: -[:REL*min..max]-> */
@@ -60,19 +90,7 @@ typedef enum IgraphCondOp {
     COND_GT,  COND_GTE,
 } IgraphCondOp;
 
-typedef enum IgraphValType {
-    VAL_INT, VAL_FLOAT, VAL_STRING, VAL_BOOL, VAL_NULL
-} IgraphValType;
-
-typedef struct IgraphValue {
-    IgraphValType type;
-    union {
-        int64       ival;
-        double      fval;
-        char       *sval;
-        bool        bval;
-    };
-} IgraphValue;
+/* Moved above - removed duplicate */
 
 typedef struct IgraphCond {
     char         *alias;    /* variable: "n"                    */
@@ -113,6 +131,10 @@ typedef struct IgraphStmtCreateNode {
     char       **prop_names;
     IgraphValue *prop_vals;
     int          prop_count;
+    /* REF support */
+    char        *ref_type;      /* REF target label, e.g. "User" */
+    IgraphValue  ref_value;     /* REF UUID value */
+    bool         has_ref;       /* true if REF specified */
 } IgraphStmtCreateNode;
 
 typedef struct IgraphStmtCreateEdge {
@@ -165,11 +187,20 @@ typedef struct IgraphStmt {
 /* Parse a query string → IgraphStmt AST */
 IgraphStmt *igraph_parse(const char *query);
 
-/* Execute an AST → JSONB result */
+/* Parse a query string with extended context → IgraphStmt AST */
+IgraphStmt *igraph_parse_extended(const char *query, const char *table_prefix, Jsonb *json_params);
+
+/* Execute an AST → JSONB result (legacy, uses default table names) */
 Jsonb *igraph_execute(IgraphStmt *stmt);
+
+/* Execute an AST with context → JSONB result */
+Jsonb *igraph_execute_with_context(IgraphStmt *stmt, IgraphExecContext *ctx);
 
 /* Free an AST (uses pfree) */
 void igraph_stmt_free(IgraphStmt *stmt);
+
+/* Resolve JSON parameter value from path like "data.threshold" */
+IgraphValue igraph_resolve_param(const char *param_path, Jsonb *json_params);
 
 #endif /* IGRAPH_QUERY_H */
 

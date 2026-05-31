@@ -11,6 +11,7 @@
 #include "igraph_query.h"
 #include "igraph_parser.h"
 #include "igraph_lexer.h"
+#include <strings.h>
 
 /* ── Error reporting ─────────────────────────── */
 static void yyerror(YYLTYPE *loc, IgraphParseState *state,
@@ -37,6 +38,9 @@ static IgraphNodePat *make_node_pat(char *alias, char *label)
     IgraphNodePat *p = ALLOC(IgraphNodePat);
     p->alias = alias;
     p->label = label;
+    p->ref_type = NULL;
+    p->has_ref = false;
+    memset(&p->ref_value, 0, sizeof(p->ref_value));
     return p;
 }
 
@@ -134,18 +138,19 @@ typedef void *yyscan_t;
     IgraphReturnField *ret_field;
     IgraphStmt        *stmt;
     struct { int min; int max; } depth;
+    struct { char *type; IgraphValue value; } ref_data;
 }
 
 /* ── Tokens ──────────────────────────────────── */
 %token TK_MATCH TK_WHERE TK_RETURN
 %token TK_PATH TK_FROM TK_TO TK_VIA TK_NODES
-%token TK_CREATE TK_DELETE TK_NODE TK_EDGE
-%token TK_SET TK_GET TK_PROPERTIES
+%token TK_CREATE TK_DELETE TK_NODE
+%token TK_SET TK_GET TK_PROPERTIES TK_REF
 %token TK_AND TK_OR TK_NOT TK_NULL
 
 %token <ival>  TK_INTEGER
 %token <fval>  TK_FLOAT
-%token <sval>  TK_STRING TK_IDENT
+%token <sval>  TK_STRING TK_IDENT TK_PARAM
 %token <bval>  TK_BOOL
 
 %token TK_LPAREN TK_RPAREN
@@ -172,6 +177,7 @@ typedef void *yyscan_t;
 %type <val>       literal
 %type <op>        cmp_op
 %type <sval>      opt_label opt_alias prop_ref_alias prop_ref_prop
+%type <ref_data>  ref_spec
 %type <ival>      node_id
 
 %%
@@ -232,6 +238,22 @@ stmt_match:
 node_pattern:
     TK_LPAREN opt_alias opt_label TK_RPAREN
         { $$ = make_node_pat($2, $3); }
+    | TK_LPAREN opt_alias opt_label ref_spec TK_RPAREN
+        {
+            IgraphNodePat *p = make_node_pat($2, $3);
+            p->ref_type = $4.type;
+            p->ref_value = $4.value;
+            p->has_ref = true;
+            $$ = p;
+        }
+    ;
+
+ref_spec:
+    TK_REF TK_IDENT TK_EQ literal
+        {
+            $$.type = $2;
+            $$.value = $4;
+        }
     ;
 
 opt_alias:
@@ -366,6 +388,18 @@ stmt_create_node:
             IgraphStmt *s = make_stmt(STMT_CREATE_NODE);
             s->create_node.label      = $5;
             s->create_node.prop_count = 0;
+            s->create_node.has_ref    = false;
+            s->create_node.ref_type   = NULL;
+            $$ = s;
+        }
+    | TK_CREATE TK_LPAREN opt_alias TK_COLON TK_IDENT ref_spec TK_RPAREN
+        {
+            IgraphStmt *s = make_stmt(STMT_CREATE_NODE);
+            s->create_node.label      = $5;
+            s->create_node.prop_count = 0;
+            s->create_node.has_ref    = true;
+            s->create_node.ref_type   = $6.type;
+            s->create_node.ref_value  = $6.value;
             $$ = s;
         }
     ;
@@ -412,8 +446,14 @@ stmt_delete_node:
  *   DELETE EDGE FROM 1 TO 2 VIA PARENT_OF
  * ================================================================ */
 stmt_delete_edge:
-    TK_DELETE TK_EDGE TK_FROM node_id TK_TO node_id TK_VIA TK_IDENT
+    TK_DELETE TK_IDENT TK_FROM node_id TK_TO node_id TK_VIA TK_IDENT
         {
+            /* Verify that the second token is "edge" */
+            if (strcasecmp($2, "edge") != 0) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_SYNTAX_ERROR),
+                     errmsg("expected EDGE after DELETE, got '%s'", $2)));
+            }
             IgraphStmt *s = make_stmt(STMT_DELETE_EDGE);
             s->delete_edge.from_id  = $4;
             s->delete_edge.to_id    = $6;
@@ -465,27 +505,32 @@ node_id:
 literal:
       TK_INTEGER
         {
-            $$.type = VAL_INT;
+            $$.type = IGRAPH_VAL_INT;
             $$.ival = $1;
         }
     | TK_FLOAT
         {
-            $$.type = VAL_FLOAT;
+            $$.type = IGRAPH_VAL_FLOAT;
             $$.fval = $1;
         }
     | TK_STRING
         {
-            $$.type = VAL_STRING;
+            $$.type = IGRAPH_VAL_STRING;
             $$.sval = $1;
         }
     | TK_BOOL
         {
-            $$.type = VAL_BOOL;
+            $$.type = IGRAPH_VAL_BOOL;
             $$.bval = $1;
         }
     | TK_NULL
         {
-            $$.type = VAL_NULL;
+            $$.type = IGRAPH_VAL_NULL;
+        }
+    | TK_PARAM
+        {
+            $$.type = IGRAPH_VAL_PARAM;
+            $$.param_path = $1;
         }
     ;
 

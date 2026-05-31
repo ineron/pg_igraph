@@ -45,6 +45,7 @@ INTEGER     {DIGIT}+
 FLOAT       {DIGIT}+\.{DIGIT}+
 IDENT       {ALPHA}{ALNUM}*
 STRING      '([^'\\]|\\.)*'
+PARAM_PATH  &{IDENT}(\.{IDENT})*
 
 %%
 
@@ -64,10 +65,10 @@ STRING      '([^'\\]|\\.)*'
 "CREATE"        { return TK_CREATE;     }
 "DELETE"        { return TK_DELETE;     }
 "NODE"          { return TK_NODE;       }
-"EDGE"          { return TK_EDGE;       }
 "SET"           { return TK_SET;        }
 "GET"           { return TK_GET;        }
 "PROPERTIES"    { return TK_PROPERTIES; }
+"REF"           { return TK_REF;        }
 "AND"           { return TK_AND;        }
 "OR"            { return TK_OR;         }
 "NOT"           { return TK_NOT;        }
@@ -114,6 +115,13 @@ STRING      '([^'\\]|\\.)*'
                     s[strlen(s) - 1] = '\0';
                     yylval->sval = s;
                     return TK_STRING;
+                }
+
+ /* ── JSON Parameters ─────────────────────────── */
+{PARAM_PATH}    {
+                    /* Strip leading & and store parameter path */
+                    yylval->sval = lexer_strdup(yytext + 1);
+                    return TK_PARAM;
                 }
 
  /* ── Identifiers ─────────────────────────────── */

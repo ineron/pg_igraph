@@ -2,7 +2,7 @@ MODULE_big   = pg_igraph
 OBJS         = pg_igraph.o igraph_lexer.o igraph_parser.o \
                igraph_exec.o igraph_query_func.o
 EXTENSION    = pg_igraph
-DATA         = pg_igraph--1.0.sql
+DATA         = pg_igraph--1.0.sql pg_igraph--1.0--1.1.sql pg_igraph--1.1.sql
 PG_CONFIG   ?= pg_config
 
 override with_llvm = no

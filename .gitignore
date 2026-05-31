@@ -1,10 +1,51 @@
-.env
-*.so
+# Build artifacts
 *.o
+*.so
+*.a
 *.bc
+
+# Generated parser files (built from .l and .y)
+igraph_lexer.c
+igraph_lexer.h
+igraph_parser.c
+igraph_parser.h
+
+# Environment files
+.env
+.env.*
+
+# PostgreSQL testing
 results/
 regression.diffs
 regression.out
+*.log
 
+# Backup files
+*.backup
+*.bak
 *.old*
+*~
+
+# Development directories
 old/
+.claude/
+/articles
+docs/
+sql/
+pgxn_package/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+CLAUDE.md
+    
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Testing and local data
+test_*.sql
+*.dump
+*.sql.bak
