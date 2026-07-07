@@ -14,7 +14,7 @@
 #include <strings.h>
 
 /* ── Error reporting ─────────────────────────── */
-static void yyerror(YYLTYPE *loc, IgraphParseState *state,
+static void igraph_yyerror(YYLTYPE *loc, IgraphParseState *state,
                     yyscan_t scanner, const char *msg)
 {
     ereport(ERROR,
@@ -115,7 +115,23 @@ static IgraphReturnField *rf_append(IgraphReturnField *head,
 typedef void *yyscan_t;
 #endif
 }
+
+/*
+ * %code provides — copied into igraph_parser.h, after the
+ * IGRAPH_YYSTYPE/IGRAPH_YYLTYPE type declarations. flex's generated
+ * lexer (igraph_lexer.c/.h) still refers to the unprefixed YYSTYPE/
+ * YYLTYPE names in its bison-bridge boilerplate, so alias them here
+ * for anyone who includes igraph_parser.h before igraph_lexer.h.
+ */
+%code provides {
+#define YYSTYPE IGRAPH_YYSTYPE
+#define YYLTYPE IGRAPH_YYLTYPE
+}
 %define api.pure full          /* reentrant */
+%define api.prefix {igraph_yy} /* namespace yy* symbols so they don't
+                                 * collide with another loaded extension's
+                                 * identically-named flex/bison globals
+                                 * (must match igraph_lexer.l's prefix) */
 %define parse.error verbose    /* detailed error messages */
 %locations                     /* track source locations */
 

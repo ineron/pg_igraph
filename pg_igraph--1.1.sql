@@ -214,15 +214,15 @@ CREATE FUNCTION igraph_query(query TEXT)
 --   table_prefix - Prefix for table names (e.g., 'users' creates 'users_nodes', 'users_edges', etc.)
 --                  If empty string, uses default tables (nodes, edges, etc.)
 --   query        - Query string with optional &data.param syntax for JSON parameter references
---   json_params  - JSON object with parameters (e.g., '{"data":{"threshold":123}}')
+--   json_params  - JSONB object with parameters (e.g., '{"data":{"threshold":123}}'::jsonb)
 --
 -- Examples:
---   SELECT igraph_query('nodes', 'MATCH (n:User)-[:follows]->(m:User) WHERE m.influence > &data.threshold RETURN n.name', '{"data":{"threshold":100}}');
---   SELECT igraph_query('products', 'PATH FROM &data.start TO &data.end VIA RELATED', '{"data":{"start":1,"end":99}}');
+--   SELECT igraph_query('nodes', 'MATCH (n:User)-[:follows]->(m:User) WHERE m.influence > &data.threshold RETURN n.name', '{"data":{"threshold":100}}'::jsonb);
+--   SELECT igraph_query('products', 'PATH FROM &data.start TO &data.end VIA RELATED', '{"data":{"start":1,"end":99}}'::jsonb);
 --   SELECT igraph_query('social', 'CREATE (n:User)', NULL);
 --   SELECT igraph_query('', 'PATH FROM 1 TO 2 VIA follows', NULL); -- Use default tables
 -- Version with table prefix and JSON parameters (full version)
-CREATE FUNCTION igraph_query(table_prefix TEXT, query TEXT, json_params TEXT)
+CREATE FUNCTION igraph_query(table_prefix TEXT, query TEXT, json_params JSONB)
   RETURNS JSONB
   AS 'pg_igraph', 'igraph_query_extended'
   LANGUAGE C;

@@ -11,6 +11,12 @@
 #include "igraph_query.h"    /* shared types — must come before parser.h */
 #include "igraph_parser.h"   /* Bison-generated token definitions */
 
+/* Bison's api.prefix renames YYSTYPE/YYLTYPE to IGRAPH_YYSTYPE/IGRAPH_YYLTYPE;
+ * flex's own bison-bridge boilerplate still emits the unprefixed names, so
+ * alias them back before flex's generated code uses them. */
+#define YYSTYPE IGRAPH_YYSTYPE
+#define YYLTYPE IGRAPH_YYLTYPE
+
 /* Current parse state — passed through for error reporting */
 #define YY_EXTRA_TYPE IgraphParseState *
 
@@ -28,6 +34,11 @@ static char *lexer_strdup(const char *s) {
 /* ── Flex options ─────────────────────────────── */
 /* Options: reentrant, bison-bridge, bison-locations, noyywrap */
 /* case-insensitive keywords, nodefault for unmatched warning   */
+/* prefix: renames all generated yy* symbols to igraph_yy* so they
+ * don't collide with another extension's identically-named
+ * flex/bison globals when both .so's are loaded into the same
+ * backend (symbol interposition caused a wild jump into this file
+ * from an unrelated extension's parser — see git history) */
 %option reentrant
 %option bison-bridge
 %option bison-locations
@@ -35,6 +46,7 @@ static char *lexer_strdup(const char *s) {
 %option noyywrap
 %option case-insensitive
 %option nodefault
+%option prefix="igraph_yy"
 
 /* ── Character classes ────────────────────────── */
 DIGIT       [0-9]

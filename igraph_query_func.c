@@ -124,19 +124,32 @@ igraph_parse_extended(const char *query, const char *table_prefix, Jsonb *json_p
     state.json_params  = json_params;
 
     /* Initialise reentrant scanner */
-    if (yylex_init_extra(&state, &scanner) != 0)
+    if (igraph_yylex_init_extra(&state, &scanner) != 0)
         ereport(ERROR,
             (errcode(ERRCODE_INTERNAL_ERROR),
              errmsg("igraph: failed to initialise lexer")));
 
-    buf = yy_scan_string(query, scanner);
-    yy_switch_to_buffer(buf, scanner);
+    buf = igraph_yy_scan_string(query, scanner);
+    igraph_yy_switch_to_buffer(buf, scanner);
 
-    /* Run parser — throws ereport(ERROR) on syntax error */
-    int rc = yyparse(&state, scanner);
-
-    yy_delete_buffer(buf, scanner);
-    yylex_destroy(scanner);
+    /*
+     * Run parser — throws ereport(ERROR) on syntax error, which longjmps
+     * past ordinary cleanup. PG_TRY/PG_FINALLY ensures the flex scanner
+     * (malloc'd, not palloc'd — a syntax error would otherwise leak it
+     * permanently rather than have it cleaned up by memory context reset)
+     * is always destroyed, success or failure.
+     */
+    int rc;
+    PG_TRY();
+    {
+        rc = igraph_yyparse(&state, scanner);
+    }
+    PG_FINALLY();
+    {
+        igraph_yy_delete_buffer(buf, scanner);
+        igraph_yylex_destroy(scanner);
+    }
+    PG_END_TRY();
 
     if (rc != 0 || state.result == NULL)
         ereport(ERROR,
@@ -224,7 +237,7 @@ Datum igraph_query(PG_FUNCTION_ARGS)
 }
 
 /* ================================================================
- * PG function: igraph_query(table_prefix TEXT, query TEXT, json_params TEXT) → JSONB
+ * PG function: igraph_query(table_prefix TEXT, query TEXT, json_params JSONB) → JSONB
  * ================================================================ */
 PG_FUNCTION_INFO_V1(igraph_query_extended);
 Datum igraph_query_extended(PG_FUNCTION_ARGS)
@@ -243,22 +256,13 @@ Datum igraph_query_extended(PG_FUNCTION_ARGS)
 
     text                 *table_prefix_text = PG_GETARG_TEXT_PP(0);
     text                 *query_text        = PG_GETARG_TEXT_PP(1);
-    text                 *json_params_text  = PG_ARGISNULL(2) ? NULL : PG_GETARG_TEXT_PP(2);
+    Jsonb                *json_params       = PG_ARGISNULL(2) ? NULL : PG_GETARG_JSONB_P(2);
     char                 *table_prefix      = text_to_cstring(table_prefix_text);
     char                 *query_str         = text_to_cstring(query_text);
-    char                 *json_params_str   = json_params_text ? text_to_cstring(json_params_text) : NULL;
 
-    Jsonb                *json_params       = NULL;
     IgraphStmt           *stmt;
     IgraphExecContext     ctx;
     Jsonb                *result;
-
-    /* Parse JSON parameters if provided */
-    if (json_params_str && strlen(json_params_str) > 0)
-    {
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json_params_str));
-        json_params = DatumGetJsonbP(jsonb_datum);
-    }
 
     /* Parse query with extended context */
     stmt = igraph_parse_extended(query_str, table_prefix, json_params);

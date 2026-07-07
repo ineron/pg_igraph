@@ -1761,12 +1761,29 @@ Datum graph_delete_node(PG_FUNCTION_ARGS)
  * Field names are read from complex_type_fields ordered by position.
  * ================================================================ */
 #define ILIB_OP_TEXT     0x01   /* str_to_bytea → op_id=0x01, params=0 */
-#define ILIB_OP_NUMERIC  0x02   /* numeric_to_bytea → op_id=0x02, params=scale */
-#define ILIB_OP_DATE     0x04   /* date_to_bytea → op_id=0x04, params=tz_offset */
-#define ILIB_OP_BOOL     0x05
-#define ILIB_OP_UUID     0x08
-#define ILIB_OP_COMPLEX  0x0E
-#define ILIB_OP_HEX      0x0F
+#define ILIB_OP_NUMERIC  0x02   /* numeric_to_bytea / bigint_to_bytea → op_id=0x02, params=scale */
+#define ILIB_OP_BOOL     0x03   /* bool_to_bytea → op_id=0x03. Verified against the
+                                 * live pg_ilib 1.5 build (2026-07-07): bool_to_bytea()
+                                 * actually emits nibble 0x03, not 0x05. The previous
+                                 * 0x05 here never matched anything pg_ilib produces —
+                                 * every real BOOL property silently fell through to
+                                 * the generic hex-string fallback in
+                                 * ilib_field_to_jsonb() instead of decoding as a JSON
+                                 * boolean, and any BOOL field nested inside a complex
+                                 * type hit the "unknown op_id" error in
+                                 * ilib_field_size() instead. */
+#define ILIB_OP_DATE     0x04   /* date_to_bytea / timestamp_to_bytea → op_id=0x04, params=tz_offset */
+#define ILIB_OP_UUID     0x08   /* uuid_to_bytea → op_id=0x08 */
+#define ILIB_OP_COMPLEX  0x0E   /* pg_igraph complex-type payloads. jsonb_to_bytea()
+                                 * also emits this nibble, but with its own internal
+                                 * encoding (params = 0, not a real complex_types.id) —
+                                 * decoding a jsonb property looks up type_id=0 in
+                                 * complex_type_fields, finds no fields, and correctly
+                                 * (if uselessly) returns {}. pg_igraph cannot currently
+                                 * decode pg_ilib jsonb properties; this is a protocol
+                                 * mismatch between the two extensions, not something
+                                 * fixable by changing a constant. */
+#define ILIB_OP_HEX      0x0F   /* hex_to_bytea → op_id=0x0F, params=byte count */
 
 #define ILIB_OP(b0)      (((unsigned char)(b0) & 0xF0) >> 4)
 #define ILIB_PARAMS(b0, b1) ((((unsigned char)(b0) & 0x0F) << 8) | (unsigned char)(b1))
@@ -2098,10 +2115,23 @@ ilib_field_size(uint8_t op_id, uint16_t params, const unsigned char *payload,
 /*
  * Decode a single pg_ilib primitive field to a JsonbValue.
  * Caller provides op_id, params, payload pointer and size.
+ *
+ * `nested_in_complex` matters for ILIB_OP_NUMERIC only: inside a
+ * complex-type payload the GMP bytes are prefixed with a 1-byte length
+ * (see ilib_field_size) because fields are packed back-to-back with no
+ * other way to know where one ends. A top-level (standalone) property has
+ * no such prefix — the bytea's own varlena length already delimits it, so
+ * `size` directly is the GMP byte count. Treating a top-level NUMERIC as
+ * if it had the nested 1-byte prefix (as this code used to, unconditionally)
+ * misreads the first real GMP byte as a length and can read far past the
+ * actual buffer — a confirmed OOB heap read for any top-level numeric or
+ * bigint property (reproduced 2026-07-07: numeric_to_bytea(123.45) sized 2
+ * payload bytes, misread as declaring a 48-byte GMP value).
  */
 static void
 ilib_field_to_jsonb(uint8_t op_id, uint16_t params,
                     const unsigned char *payload, size_t size,
+                    bool nested_in_complex,
                     JsonbValue *out)
 {
     switch (op_id)
@@ -2109,16 +2139,35 @@ ilib_field_to_jsonb(uint8_t op_id, uint16_t params,
         case ILIB_OP_NUMERIC:
         {
             /*
-             * Inside complex payload: [gmp_len: 1 byte][GMP bytes]
              * params = scale (0=integer, >0=decimal point position)
              * Return as hex string — client decodes with pg_ilib
              * bytea_to_numeric() which reconstructs via GMP.
              */
-            uint8_t gmp_len = payload[0];
-            const unsigned char *gmp = payload + 1;
+            size_t gmp_len;
+            const unsigned char *gmp;
             static const char hx[] = "0123456789abcdef";
-            char *hex = palloc(gmp_len * 2 + 1);
-            for (uint8_t k = 0; k < gmp_len; k++)
+            char *hex;
+
+            if (nested_in_complex)
+            {
+                if (size < 1)
+                    elog(ERROR, "pg_igraph: truncated NUMERIC field "
+                         "(need >=1 byte for gmp_len, got %zu)", size);
+                gmp_len = payload[0];
+                if (size < 1 + gmp_len)
+                    elog(ERROR, "pg_igraph: truncated NUMERIC field "
+                         "(need %zu bytes, got %zu)", 1 + gmp_len, size);
+                gmp = payload + 1;
+            }
+            else
+            {
+                /* top-level: whole remaining payload is the GMP bytes */
+                gmp_len = size;
+                gmp = payload;
+            }
+
+            hex = palloc(gmp_len * 2 + 1);
+            for (size_t k = 0; k < gmp_len; k++)
             {
                 hex[k*2]   = hx[gmp[k] >> 4];
                 hex[k*2+1] = hx[gmp[k] & 0x0f];
@@ -2148,6 +2197,9 @@ ilib_field_to_jsonb(uint8_t op_id, uint16_t params,
 
         case ILIB_OP_BOOL:
         {
+            if (size < 1)
+                elog(ERROR, "pg_igraph: truncated BOOL field "
+                     "(need 1 byte, got %zu)", size);
             out->type         = jbvBool;
             out->val.boolean  = (payload[0] != 0);
             break;
@@ -2157,6 +2209,10 @@ ilib_field_to_jsonb(uint8_t op_id, uint16_t params,
         {
             /* Format as standard UUID string */
             char buf[37];
+
+            if (size < 16)
+                elog(ERROR, "pg_igraph: truncated UUID field "
+                     "(need 16 bytes, got %zu)", size);
             snprintf(buf, sizeof(buf),
                 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x"
                 "-%02x%02x%02x%02x%02x%02x",
@@ -2174,6 +2230,10 @@ ilib_field_to_jsonb(uint8_t op_id, uint16_t params,
         {
             /* params = timezone offset in minutes; payload = uint32 unix ts */
             uint32_t ts = 0;
+
+            if (size < 4)
+                elog(ERROR, "pg_igraph: truncated DATE field "
+                     "(need 4 bytes, got %zu)", size);
             for (size_t i = 0; i < 4; i++)
                 ts = (ts << 8) | payload[i];
             /* Return as numeric unix timestamp for now */
@@ -2201,6 +2261,190 @@ ilib_field_to_jsonb(uint8_t op_id, uint16_t params,
             break;
         }
     }
+}
+
+/*
+ * decode_node_properties_jsonb — shared decode loop for
+ * graph_get_node_properties[_extended].
+ *
+ * Expects SPI_tuptable (already populated by the caller's query) to hold
+ * `nrows` rows of (name, primitive, value bytea) — columns 1 and 3 are
+ * read, column 2 (primitive) is informational only, the real op_id comes
+ * from the bytea's own header. `table_prefix` (raw, as passed by the SQL
+ * caller — NULL/empty for the default unprefixed graph) is used to build
+ * the ILIB_OP_COMPLEX field-name lookup table on demand, per row — see
+ * note below on why it's rebuilt each time rather than passed pre-built.
+ *
+ * IMPORTANT #1: every row is snapshotted out of SPI_tuptable *before* any
+ * decoding happens. Decoding ILIB_OP_COMPLEX fields requires a nested
+ * SPI_execute_plan() call (to resolve field names), which overwrites the
+ * global SPI_tuptable/SPI_processed. An earlier version of this code
+ * read SPI_tuptable->vals[i] fresh at the top of each loop iteration, so
+ * any row after a complex-typed property indexed into the *wrong,
+ * already-overwritten* tuple table — an out-of-bounds/wild HeapTuple
+ * pointer dereference. Snapshotting up front removes any live dependency
+ * on SPI_tuptable once the decode loop starts.
+ *
+ * IMPORTANT #2: the complex_type_fields table name is rebuilt via
+ * build_table_name() fresh, immediately before each nested SPI_prepare
+ * call, rather than built once before the loop and reused. Confirmed by
+ * direct testing (2026-07-07): a version that built it once up front and
+ * reused the same pointer across multiple ILIB_OP_COMPLEX rows corrupted
+ * — after enough nested SPI_execute_plan() calls the memory backing that
+ * palloc'd string got recycled (observed reading back literal '{' bytes
+ * from an unrelated in-flight JSON buffer that happened to reuse the same
+ * address) and the query text built from it became garbage, throwing a
+ * syntax error. Reproduced with both prefixed and even flat (no dot)
+ * prefixes once a node had more than a couple of jsonb properties — i.e.
+ * any node with several properties (exactly what richer property writes,
+ * e.g. per-agent config, look like) would hit this. Building the name
+ * fresh right before use, with no SPI call intervening between the build
+ * and the use, avoids the hazard entirely — same principle as snapshotting
+ * SPI_tuptable above.
+ */
+static Jsonb *
+decode_node_properties_jsonb(uint64 nrows, const char *table_prefix)
+{
+    JsonbParseState *state = NULL;
+    JsonbValue       jv;
+    uint64           i;
+    char           **names;
+    bytea          **values;   /* NULL entry = row was SQL NULL, skip */
+
+    /* Pass 1: snapshot (name, value) out of SPI_tuptable up front. */
+    names  = palloc(nrows * sizeof(char *));
+    values = palloc(nrows * sizeof(bytea *));
+    for (i = 0; i < nrows; i++)
+    {
+        bool      isnull;
+        TupleDesc td = SPI_tuptable->tupdesc;
+        HeapTuple ht = SPI_tuptable->vals[i];
+        Datum     d_name, d_val;
+
+        d_name = SPI_getbinval(ht, td, 1, &isnull);
+        if (isnull) { names[i] = NULL; values[i] = NULL; continue; }
+        names[i] = TextDatumGetCString(d_name);
+
+        d_val = SPI_getbinval(ht, td, 3, &isnull);
+        if (isnull) { values[i] = NULL; continue; }
+        values[i] = DatumGetByteaPCopy(d_val);
+    }
+
+    /* Pass 2: decode. Free to make nested SPI calls (complex fields) now
+     * that nothing here still reads from the original SPI_tuptable. */
+    pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+
+    for (i = 0; i < nrows; i++)
+    {
+        char     *prop_name = names[i];
+        bytea    *bv         = values[i];
+        unsigned char *raw;
+        int       blen;
+        uint8_t   op_id;
+        uint16_t  params;
+
+        if (prop_name == NULL || bv == NULL)
+            continue;
+
+        raw = (unsigned char *) VARDATA_ANY(bv);
+        blen = VARSIZE_ANY_EXHDR(bv);
+
+        if (blen < 2) continue;  /* malformed */
+
+        op_id  = ILIB_OP(raw[0]);
+        params = ILIB_PARAMS(raw[0], raw[1]);
+
+        jv.type           = jbvString;
+        jv.val.string.val = prop_name;
+        jv.val.string.len = strlen(prop_name);
+        pushJsonbValue(&state, WJB_KEY, &jv);
+
+        if (op_id == ILIB_OP_COMPLEX)
+        {
+            uint16_t        type_id = params;
+            char           *complex_type_fields_table;
+            StringInfoData  cf_query;
+            SPIPlanPtr      cf_plan;
+            Oid             cf_types[] = { INT2OID };
+            Datum           cf_args[1];
+            int             cret;
+            uint64          nfields, f;
+            char          **field_names;
+            unsigned char  *ptr, *end;
+
+            /* Built fresh right here, used immediately, no SPI call in
+             * between — see IMPORTANT #2 above for why. */
+            complex_type_fields_table = build_table_name(table_prefix, "complex_type_fields");
+
+            initStringInfo(&cf_query);
+            appendStringInfo(&cf_query,
+                "SELECT pos, field_name FROM %s WHERE type_id = $1 ORDER BY pos",
+                complex_type_fields_table);
+            cf_plan = SPI_prepare(cf_query.data, 1, cf_types);
+            if (!cf_plan)
+                elog(ERROR, "pg_igraph: failed to prepare complex-field "
+                     "lookup against %s", complex_type_fields_table);
+
+            cf_args[0] = Int16GetDatum((int16) type_id);
+            cret = SPI_execute_plan(cf_plan, cf_args, NULL, true, 0);
+            if (cret != SPI_OK_SELECT)
+                elog(ERROR, "pg_igraph: failed to fetch complex fields "
+                     "for type_id=%d", type_id);
+
+            /* Copy field names out before any nested SPI call overwrites tuptable */
+            nfields = SPI_processed;
+            field_names = palloc(nfields * sizeof(char *));
+            for (f = 0; f < nfields; f++)
+            {
+                bool  fn;
+                Datum dn = SPI_getbinval(SPI_tuptable->vals[f],
+                                         SPI_tuptable->tupdesc, 2, &fn);
+                field_names[f] = fn ? pstrdup("?") : TextDatumGetCString(dn);
+            }
+
+            ptr = raw + 2;   /* skip complex header */
+            end = raw + blen;
+
+            pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+
+            for (f = 0; f < nfields && ptr + 2 <= end; f++)
+            {
+                uint8_t    fop   = ILIB_OP(ptr[0]);
+                uint16_t   fmeta = ILIB_PARAMS(ptr[0], ptr[1]);
+                size_t     fsize;
+                JsonbValue fval;
+
+                ptr += 2;
+
+                fsize = ilib_field_size(fop, fmeta, ptr, end);
+                if (ptr + fsize > end)
+                    fsize = (size_t)(end - ptr);  /* clamp to safe range */
+
+                jv.type           = jbvString;
+                jv.val.string.val = field_names[f];
+                jv.val.string.len = strlen(field_names[f]);
+                pushJsonbValue(&state, WJB_KEY, &jv);
+
+                ilib_field_to_jsonb(fop, fmeta, ptr, fsize, true, &fval);
+                pushJsonbValue(&state, WJB_VALUE, &fval);
+
+                ptr += fsize;
+            }
+
+            pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+        }
+        else
+        {
+            unsigned char *payload = raw + 2;
+            size_t         psize   = (size_t)(blen - 2);
+            JsonbValue     pval;
+
+            ilib_field_to_jsonb(op_id, params, payload, psize, false, &pval);
+            pushJsonbValue(&state, WJB_VALUE, &pval);
+        }
+    }
+
+    return JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
 }
 
 /* ================================================================
@@ -2383,125 +2627,7 @@ Datum graph_get_node_properties(PG_FUNCTION_ARGS)
     if (ret != SPI_OK_SELECT)
         elog(ERROR, "graph_get_node_properties: query failed");
 
-    /*
-     * Build JSONB manually using JsonbInState.
-     * Structure: object → per-prop object → { primitive, value }
-     */
-    JsonbParseState *state = NULL;
-    JsonbValue       jv;
-
-    pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-
-    for (uint64 i = 0; i < SPI_processed; i++)
-    {
-        bool      isnull;
-        TupleDesc td = SPI_tuptable->tupdesc;
-        HeapTuple ht = SPI_tuptable->vals[i];
-
-        /* Column 1: prop name */
-        Datum d_name = SPI_getbinval(ht, td, 1, &isnull);
-        if (isnull) continue;
-        char *prop_name = TextDatumGetCString(d_name);
-
-        /* Column 3: raw bytea value */
-        Datum  d_val = SPI_getbinval(ht, td, 3, &isnull);
-        if (isnull) continue;
-
-        bytea         *bv  = DatumGetByteaPCopy(d_val);
-        unsigned char *raw = (unsigned char *) VARDATA_ANY(bv);
-        int            blen = VARSIZE_ANY_EXHDR(bv);
-
-        if (blen < 2) continue;  /* malformed */
-
-        uint8_t  op_id  = ILIB_OP(raw[0]);
-        uint16_t params = ILIB_PARAMS(raw[0], raw[1]);
-
-        /* Emit JSON key */
-        jv.type           = jbvString;
-        jv.val.string.val = prop_name;
-        jv.val.string.len = strlen(prop_name);
-        pushJsonbValue(&state, WJB_KEY, &jv);
-
-        if (op_id == ILIB_OP_COMPLEX)
-        {
-            /*
-             * Complex type: params = complex_type_id
-             * Payload starts at raw+2 and contains sequential fields,
-             * each with its own 2-byte pg_ilib header.
-             * Fetch field names from complex_type_fields, then decode.
-             */
-            uint16_t type_id = params;
-
-            /* Fetch field names — need a nested SPI call */
-            prepare_complex_plans();
-
-            Datum cf_args[] = { Int16GetDatum((int16) type_id) };
-            int cret = SPI_execute_plan(plan_get_complex_fields_p,
-                                        cf_args, NULL, true, 0);
-            if (cret != SPI_OK_SELECT)
-                elog(ERROR, "graph_get_node_properties: failed to fetch "
-                     "complex fields for type_id=%d", type_id);
-
-            /* Copy field names out before next SPI call overwrites tuptable */
-            uint64  nfields    = SPI_processed;
-            char  **field_names = palloc(nfields * sizeof(char *));
-            for (uint64 f = 0; f < nfields; f++)
-            {
-                bool fn;
-                Datum dn = SPI_getbinval(SPI_tuptable->vals[f],
-                                         SPI_tuptable->tupdesc, 2, &fn);
-                field_names[f] = fn ? pstrdup("?") : TextDatumGetCString(dn);
-            }
-
-            /* Decode payload field by field */
-            unsigned char *ptr = raw + 2;   /* skip complex header */
-            unsigned char *end = raw + blen;
-
-            pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-
-            for (uint64 f = 0; f < nfields && ptr + 2 <= end; f++)
-            {
-                uint8_t  fop    = ILIB_OP(ptr[0]);
-                uint16_t fmeta  = ILIB_PARAMS(ptr[0], ptr[1]);
-                ptr += 2;
-
-                size_t fsize = ilib_field_size(fop, fmeta, ptr, end);
-                if (ptr + fsize > end)
-                    fsize = (size_t)(end - ptr);  /* clamp to safe range */
-
-                /* Emit field key */
-                jv.type           = jbvString;
-                jv.val.string.val = field_names[f];
-                jv.val.string.len = strlen(field_names[f]);
-                pushJsonbValue(&state, WJB_KEY, &jv);
-
-                /* Decode and emit field value */
-                JsonbValue fval;
-                ilib_field_to_jsonb(fop, fmeta, ptr, fsize, &fval);
-                pushJsonbValue(&state, WJB_VALUE, &fval);
-
-                ptr += fsize;
-            }
-
-            pushJsonbValue(&state, WJB_END_OBJECT, NULL);
-        }
-        else
-        {
-            /*
-             * Primitive type: decode payload (raw+2 onwards) directly.
-             * Emit decoded value — no wrapper object, clean JSON value.
-             */
-            unsigned char *payload = raw + 2;
-            size_t         psize   = (size_t)(blen - 2);
-
-            JsonbValue pval;
-            ilib_field_to_jsonb(op_id, params, payload, psize, &pval);
-            pushJsonbValue(&state, WJB_VALUE, &pval);
-        }
-    }
-
-    JsonbValue *result_jv = pushJsonbValue(&state, WJB_END_OBJECT, NULL);
-    Jsonb      *result    = JsonbValueToJsonb(result_jv);
+    Jsonb *result = decode_node_properties_jsonb(SPI_processed, NULL);
 
     SPI_finish();
     PG_RETURN_POINTER(result);
@@ -3262,11 +3388,13 @@ Datum graph_get_node_properties_extended(PG_FUNCTION_ARGS)
 
     SPI_connect();
 
-    /* Get all properties for the node */
+    /* Get all properties for the node — same (name, primitive, value) shape
+     * that decode_node_properties_jsonb() expects, so prefixed graphs decode
+     * exactly like the default one instead of falling back to raw-bytes text. */
     StringInfoData get_props_query;
     initStringInfo(&get_props_query);
     appendStringInfo(&get_props_query,
-        "SELECT pt.name, np.value FROM %s np "
+        "SELECT pt.name, pt.primitive, np.value FROM %s np "
         "JOIN %s pt ON np.prop_id = pt.id "
         "WHERE np.node_id = $1 ORDER BY pt.name",
         node_properties_table, property_types_table);
@@ -3286,43 +3414,7 @@ Datum graph_get_node_properties_extended(PG_FUNCTION_ARGS)
         elog(ERROR, "graph_get_node_properties_extended: failed to execute query");
     }
 
-    JsonbParseState *state = NULL;
-    JsonbValue jb_val;
-
-    jb_val.type = jbvObject;
-    pushJsonbValue(&state, WJB_BEGIN_OBJECT, &jb_val);
-
-    uint64 nrows = SPI_processed;
-    for (uint64 i = 0; i < nrows; i++)
-    {
-        bool isnull;
-        Datum d_name = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
-        Datum d_val = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull);
-
-        if (!isnull) {
-            char *prop_name = TextDatumGetCString(d_name);
-            bytea *bv = DatumGetByteaPCopy(d_val);
-
-            /* Simple decoding for basic types - just treat as text for now */
-            char *str_value = (char *) VARDATA(bv);
-            size_t str_len = VARSIZE(bv) - VARHDRSZ;
-
-            JsonbValue key_jb;
-            key_jb.type = jbvString;
-            key_jb.val.string.len = strlen(prop_name);
-            key_jb.val.string.val = prop_name;
-            pushJsonbValue(&state, WJB_KEY, &key_jb);
-
-            JsonbValue val_jb;
-            val_jb.type = jbvString;
-            val_jb.val.string.len = str_len;
-            val_jb.val.string.val = str_value;
-            pushJsonbValue(&state, WJB_VALUE, &val_jb);
-        }
-    }
-
-    JsonbValue *result_jv = pushJsonbValue(&state, WJB_END_OBJECT, NULL);
-    Jsonb *result = JsonbValueToJsonb(result_jv);
+    Jsonb *result = decode_node_properties_jsonb(SPI_processed, table_prefix);
 
     SPI_finish();
     pfree(property_types_table);
