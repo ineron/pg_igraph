@@ -56,36 +56,14 @@ CREATE FUNCTION graph_shortest_path(
   SELECT graph_shortest_path(start_id::bigint, end_id::bigint, rel_name)
 $$ LANGUAGE SQL STRICT;
 
-CREATE FUNCTION graph_add_edge(
-  from_id  INT,
-  to_id    INT,
-  rel_name TEXT
-) RETURNS VOID AS $$
-  SELECT graph_add_edge(from_id::bigint, to_id::bigint, rel_name)
-$$ LANGUAGE SQL STRICT;
-
-CREATE FUNCTION graph_get_property(
-  node_id   INT,
-  prop_name TEXT
-) RETURNS BYTEA AS $$
-  SELECT graph_get_property(node_id::bigint, prop_name)
-$$ LANGUAGE SQL STRICT;
-
-CREATE FUNCTION graph_set_property(
-  node_id    INT,
-  prop_name  TEXT,
-  primitive  SMALLINT,
-  value      BYTEA,
-  ref_label  TEXT DEFAULT NULL
-) RETURNS VOID AS $$
-  SELECT graph_set_property(node_id::bigint, prop_name, primitive, value, ref_label)
-$$ LANGUAGE SQL;
-
-CREATE FUNCTION graph_get_node_properties(
-  node_id INT
-) RETURNS JSONB AS $$
-  SELECT graph_get_node_properties(node_id::bigint)
-$$ LANGUAGE SQL STRICT;
+-- graph_add_edge/graph_get_property/graph_set_property/graph_get_node_properties
+-- INT aliases removed here: each collides with its own table_prefix-defaulted
+-- overload declared further below (e.g. graph_get_property(BIGINT, TEXT,
+-- TEXT DEFAULT '')) -- calling with the short arg list is ambiguous between
+-- "this N-arg function" and "that (N+1)-arg function using its default",
+-- since both match the given arguments with zero casts. The defaulted
+-- overload already accepts the short call, so the dedicated INT/BIGINT-only
+-- version is redundant, not a distinct capability. See task #8.
 
 CREATE FUNCTION graph_delete_property(
   node_id   INT,
@@ -128,31 +106,14 @@ CREATE FUNCTION graph_get_complex_fields(
 --   6 = numeric
 --   7 = jsonb
 
--- Записать свойство узла
--- prop_name  — имя свойства (создаётся автоматически)
--- primitive  — тип значения (1-7)
--- value      — значение в бинарном формате (BYTEA)
--- ref_label  — если это typed ref: имя label на который ссылаемся
---              передать NULL если обычное свойство
-CREATE FUNCTION graph_set_property(
-  node_id    BIGINT,
-  prop_name  TEXT,
-  primitive  SMALLINT,
-  value      BYTEA,
-  ref_label  TEXT DEFAULT NULL
-) RETURNS VOID
-  AS 'pg_igraph', 'graph_set_property'
-  LANGUAGE C;
-
--- Прочитать свойство узла
--- Возвращает BYTEA — декодируется на стороне клиента
--- или через graph_get_property_text / graph_get_property_int
-CREATE FUNCTION graph_get_property(
-  node_id   BIGINT,
-  prop_name TEXT
-) RETURNS BYTEA
-  AS 'pg_igraph', 'graph_get_property'
-  LANGUAGE C STRICT;
+-- graph_set_property(node_id BIGINT, prop_name, primitive, value, ref_label)
+-- and graph_get_node_properties(node_id BIGINT) removed here (were the
+-- non-prefixed C-level base functions) -- each collides with its own
+-- table_prefix-defaulted overload below the same way the INT aliases did
+-- above; see the note there and task #8. graph_set_property_extended /
+-- graph_get_node_properties_extended behave identically for table_prefix=''
+-- (build_table_name() returns the bare table name for an empty prefix), so
+-- nothing is lost by keeping only the defaulted overload.
 
 -- Удалить свойство узла
 CREATE FUNCTION graph_delete_property(
@@ -162,26 +123,12 @@ CREATE FUNCTION graph_delete_property(
   AS 'pg_igraph', 'graph_delete_property'
   LANGUAGE C STRICT;
 
--- Получить все свойства узла как JSONB
-CREATE FUNCTION graph_get_node_properties(
-  node_id BIGINT
-) RETURNS JSONB
-  AS 'pg_igraph', 'graph_get_node_properties'
-  LANGUAGE C STRICT;
+-- graph_get_property(node_id BIGINT, prop_name TEXT) removed here for the
+-- same reason -- see note above.
 
--- Node deletion
--- Delete a node and all its edges, properties atomically.
--- Also removes dangling reverse edges from neighbours.
-CREATE FUNCTION graph_delete_node(node_id BIGINT)
-  RETURNS VOID
-  AS 'pg_igraph', 'graph_delete_node'
-  LANGUAGE C STRICT;
-
--- INT alias
-CREATE FUNCTION graph_delete_node(node_id INT)
-  RETURNS VOID AS $$
-  SELECT graph_delete_node(node_id::bigint)
-$$ LANGUAGE SQL STRICT;
+-- graph_delete_node(node_id BIGINT) and its INT alias removed here for the
+-- same reason -- see note above; graph_delete_node_extended with
+-- table_prefix='' targets the same default tables.
 
 -- ────────────────────────────────────────────────
 -- Query language entry point (v1.0 compatibility)

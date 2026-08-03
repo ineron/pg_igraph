@@ -14,6 +14,7 @@
 #include "utils/numeric.h"
 #include "utils/array.h"
 #include "utils/json.h"
+#include "utils/lsyscache.h"
 
 #include "igraph_query.h"
 
@@ -503,31 +504,38 @@ get_node_property_value(int64 node_id, const char *prop_name, IgraphExecContext 
     SPI_connect();
     MemoryContextSwitchTo(caller_ctx);
 
-    /* Build query with table prefix */
+    /*
+     * graph_get_property() returns the raw pg_ilib-encoded BYTEA — reading
+     * that through TextDatumGetCString() (as this code used to) treats
+     * undecoded binary bytes as if they were already text, which is wrong
+     * regardless of crash risk. graph_get_node_properties() runs the same
+     * decode path this project already trusts elsewhere
+     * (decode_node_properties_jsonb), so pull the single field out of its
+     * JSONB result with ->> instead of decoding by hand here.
+     */
     StringInfoData query;
     initStringInfo(&query);
-    appendStringInfo(&query, "SELECT graph_get_property($1, $2");
 
-    /* Add table_prefix parameter if needed */
     if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0) {
-        appendStringInfo(&query, ", $3");
+        appendStringInfo(&query, "SELECT graph_get_node_properties($1, $3) ->> $2");
+    } else {
+        appendStringInfo(&query, "SELECT graph_get_node_properties($1) ->> $2");
     }
-    appendStringInfo(&query, ")");
 
     /* Execute query */
     if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0) {
         Oid argtypes[] = { INT8OID, TEXTOID, TEXTOID };
         Datum args[] = {
             Int64GetDatum(node_id),
-            CStringGetDatum(prop_name),
-            CStringGetDatum(ctx->table_prefix)
+            CStringGetTextDatum(prop_name),
+            CStringGetTextDatum(ctx->table_prefix)
         };
         ret = SPI_execute_with_args(query.data, 3, argtypes, args, NULL, true, 1);
     } else {
         Oid argtypes[] = { INT8OID, TEXTOID };
         Datum args[] = {
             Int64GetDatum(node_id),
-            CStringGetDatum(prop_name)
+            CStringGetTextDatum(prop_name)
         };
         ret = SPI_execute_with_args(query.data, 2, argtypes, args, NULL, true, 1);
     }
