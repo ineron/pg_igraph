@@ -49,3 +49,6 @@ Thumbs.db
 test_*.sql
 *.dump
 *.sql.bak
+
+# Internal ops scripts (not part of the public project)
+pg_recover_restart.sh
