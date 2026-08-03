@@ -96,23 +96,18 @@ SELECT graph_set_property(:j1, 'meta', 7::smallint, jsonb_to_bytea('{"a":1,"b":"
 SELECT graph_get_node_properties(:j1);
 
 -- ============================================================
--- KNOWN BUG (task #19, upstream): bigint_to_bytea() in pg_ilib 1.5 does
--- not match its own documented header/encoding convention -- it writes
--- only a 1-byte header (hardcoded 0x20, silently dropping the `scale`
--- argument entirely) followed by an off-by-one magnitude loop that
--- leaves one trailing byte uninitialized, unlike numeric_to_bytea()
--- (used for both INT and FLOAT properties everywhere else in this
--- suite), which correctly writes a real 2-byte op_id/params header. The
--- two encoders are mutually inconsistent: even pg_ilib's own
--- bytea_to_bigint()/bytea_to_numeric() cannot reliably decode
--- bigint_to_bytea()'s output (confirmed directly:
--- `SELECT bytea_to_bigint(bigint_to_bytea(30::bigint))` throws
--- "numeric scale 30 is impossible for 1 payload byte(s)" in a bare
--- psql session against pg_ilib alone, nothing pg_igraph-specific). This
--- is a pg_ilib defect, filed there (not fixable from this repo) --
--- pg_igraph's own fix below (see REGRESSION ANCHORS) at least turns the
--- previous *silent wrong number* into a loud, specific error for data
--- written this way, rather than pretending to support it.
+-- FIXED UPSTREAM (task #19/#21, 2026-08-03): bigint_to_bytea() in
+-- pg_ilib used to write only a 1-byte header (hardcoded 0x20, silently
+-- dropping `scale`) with an off-by-one magnitude loop leaving one
+-- trailing byte uninitialized -- inconsistent with numeric_to_bytea()
+-- and undecodable by pg_ilib's own bytea_to_bigint()/bytea_to_numeric().
+-- pg_ilib has since rewritten the encoder to structurally match
+-- numeric_to_bytea() (confirmed byte-for-byte identical output for the
+-- same value+scale); this table's data now round-trips correctly once
+-- pg_ilib's postgresql-14.service was restarted to pick up the fix. Kept
+-- here (not moved into REGRESSION ANCHORS) since the fix lives in
+-- pg_ilib, not this repo -- a future pg_ilib regression would surface as
+-- a failure here, not a code change in pg_igraph to revert.
 -- ============================================================
 SELECT graph_add_node('NumBug') AS nb1 \gset
 SELECT graph_add_node('NumBug') AS nb2 \gset

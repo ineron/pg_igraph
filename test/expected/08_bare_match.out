@@ -1,0 +1,101 @@
+-- Bare single-node MATCH (task #14, filed from ledgyx-admin-ui,
+-- 2026-08-02): before this fixture, the grammar required a full
+-- src-rel-dst triple for every MATCH -- "MATCH (n) RETURN n" and
+-- "MATCH (n:Label) RETURN n" had no rule at all. Covers the new
+-- exec_match_bare_ctx() path (igraph_exec.c), which enumerates
+-- candidates directly (by WHERE id=, by label, or -- with neither --
+-- every node) instead of walking an edge from an anchor.
+--
+-- Fixture: two BareA nodes (Ann, Bo), one BareB node (Cy)
+SELECT MAX(id) AS max_before FROM nodes \gset
+SELECT graph_add_node('BareA') AS ann \gset
+SELECT graph_add_node('BareA') AS bo  \gset
+SELECT graph_add_node('BareB') AS cy  \gset
+SELECT graph_set_property(:ann, 'name', 2::smallint, str_to_bytea('Ann'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:bo,  'name', 2::smallint, str_to_bytea('Bo'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:cy,  'name', 2::smallint, str_to_bytea('Cy'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+-- ============================================================
+-- Label filter + RETURN projection (id, prop)
+-- ============================================================
+SELECT igraph_query('MATCH (n:BareA) RETURN n.id, n.name');
+                         igraph_query                          
+---------------------------------------------------------------
+ [{"n.id": 39, "n.name": "Ann"}, {"n.id": 40, "n.name": "Bo"}]
+(1 row)
+
+-- bare alias with no prop -> just the id
+SELECT igraph_query('MATCH (n:BareA) RETURN n');
+      igraph_query      
+------------------------
+ [{"n": 39}, {"n": 40}]
+(1 row)
+
+-- ============================================================
+-- WHERE n.id = <int> narrows enumeration to a single node
+-- ============================================================
+SELECT igraph_query(format('MATCH (n:BareA) WHERE n.id = %s RETURN n.name', :ann));
+    igraph_query     
+---------------------
+ [{"n.name": "Ann"}]
+(1 row)
+
+-- id filter + non-matching label -> no rows
+SELECT igraph_query(format('MATCH (n:BareB) WHERE n.id = %s RETURN n.name', :ann));
+ igraph_query 
+--------------
+ {}
+(1 row)
+
+-- ============================================================
+-- No RETURN clause -- default shape {"id","label"}
+-- ============================================================
+SELECT igraph_query(format('MATCH (n:BareB) WHERE n.id = %s', :cy));
+          igraph_query          
+--------------------------------
+ [{"id": 41, "label": "BareB"}]
+(1 row)
+
+-- ============================================================
+-- Label with no matching nodes -> bare {} object, not []
+-- ============================================================
+SELECT igraph_query('MATCH (n:NoSuchBareLabel) RETURN n');
+ igraph_query 
+--------------
+ {}
+(1 row)
+
+-- ============================================================
+-- WHERE on a non-id property (name), resolved per-candidate
+-- ============================================================
+SELECT igraph_query('MATCH (n:BareA) WHERE n.name = ''Bo'' RETURN n.id, n.name');
+          igraph_query          
+--------------------------------
+ [{"n.id": 40, "n.name": "Bo"}]
+(1 row)
+
+-- ============================================================
+-- No label, no id-eq WHERE: enumerates every node in the graph, then
+-- applies the WHERE filter generically per-candidate (id > a fixture-
+-- relative baseline keeps this deterministic across the whole suite)
+-- ============================================================
+SELECT igraph_query(format('MATCH (n) WHERE n.id > %s RETURN n.id, n.name', COALESCE(:max_before, 0)));
+                                        igraph_query                                         
+---------------------------------------------------------------------------------------------
+ [{"n.id": 39, "n.name": "Ann"}, {"n.id": 40, "n.name": "Bo"}, {"n.id": 41, "n.name": "Cy"}]
+(1 row)
+

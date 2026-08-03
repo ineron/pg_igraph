@@ -21,6 +21,7 @@
 /* ── Forward declarations ──────────────────────── */
 static char *build_table_name(const char *base_name, IgraphExecContext *ctx);
 static Jsonb *exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx);
+static Jsonb *exec_match_bare_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx);
 static Jsonb *exec_path_ctx(IgraphStmtPath *p, IgraphExecContext *ctx);
 static Jsonb *exec_create_node_ctx(IgraphStmtCreateNode *cn, IgraphExecContext *ctx);
 static Jsonb *exec_create_edge_ctx(IgraphStmtCreateEdge *ce, IgraphExecContext *ctx);
@@ -796,6 +797,9 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
     uint64           i;
     char            *nodes_table, *node_labels_table;
 
+    if (m->rel == NULL)
+        return exec_match_bare_ctx(m, ctx);
+
     start_id  = -1;
     rel_type  = m->rel->rel_type;
     direction = (m->rel->dir != DIR_LEFT);
@@ -1074,6 +1078,236 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
     result = DatumGetJsonbP(jsonb_datum);
 
     /* Clean up */
+    pfree(json_buf.data);
+    pfree(node_ids);
+    pfree(nodes_table);
+    pfree(node_labels_table);
+    SPI_finish();
+
+    return result;
+}
+
+/* ================================================================
+ * exec_match_bare_ctx — MATCH (n) / MATCH (n:Label) with no
+ * relationship pattern. Unlike exec_match_ctx's src-rel-dst shape,
+ * there is no traversal here: candidates are enumerated directly by
+ * an optional WHERE src.id = <int> constant, or by src's label, or
+ * (with neither) every node in the graph. `m->dst` is always NULL
+ * for this shape, so a RETURN field can only resolve against src's
+ * alias.
+ * ================================================================ */
+static Jsonb *
+exec_match_bare_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
+{
+    int64            start_id;
+    IgraphCond      *c;
+    int              ret;
+    uint64           nrows;
+    int64           *node_ids;
+    uint64           i;
+    char            *nodes_table, *node_labels_table;
+    StringInfoData   query;
+
+    start_id = -1;
+    nodes_table = build_table_name("nodes", ctx);
+    node_labels_table = build_table_name("node_labels", ctx);
+
+    /* Look for src.id = <int> to narrow enumeration to one node */
+    c = m->where;
+    while (c)
+    {
+        if (m->src->alias &&
+            strcmp(c->alias, m->src->alias) == 0 &&
+            strcmp(c->prop, "id") == 0 &&
+            c->op == COND_EQ)
+        {
+            IgraphValue resolved_val = resolve_value(c->val, ctx);
+            if (resolved_val.type == IGRAPH_VAL_INT)
+            {
+                start_id = resolved_val.ival;
+                break;
+            }
+        }
+        c = c->next;
+    }
+
+    SPI_connect();
+
+    initStringInfo(&query);
+    if (start_id >= 0 && m->src && m->src->label)
+    {
+        Oid   argtypes[] = { INT8OID, TEXTOID };
+        Datum args[]     = { Int64GetDatum(start_id),
+                              CStringGetTextDatum(m->src->label) };
+        appendStringInfo(&query,
+            "SELECT n.id FROM %s n JOIN %s nl ON nl.id = n.label "
+            "WHERE n.id = $1 AND nl.name = $2",
+            nodes_table, node_labels_table);
+        ret = SPI_execute_with_args(query.data, 2, argtypes, args,
+                                     NULL, true, 0);
+    }
+    else if (start_id >= 0)
+    {
+        Oid   argtypes[] = { INT8OID };
+        Datum args[]     = { Int64GetDatum(start_id) };
+        appendStringInfo(&query, "SELECT id FROM %s WHERE id = $1",
+                          nodes_table);
+        ret = SPI_execute_with_args(query.data, 1, argtypes, args,
+                                     NULL, true, 0);
+    }
+    else if (m->src && m->src->label)
+    {
+        Oid   argtypes[] = { TEXTOID };
+        Datum args[]     = { CStringGetTextDatum(m->src->label) };
+        appendStringInfo(&query,
+            "SELECT DISTINCT n.id FROM %s n JOIN %s nl ON nl.id = n.label "
+            "WHERE nl.name = $1",
+            nodes_table, node_labels_table);
+        ret = SPI_execute_with_args(query.data, 1, argtypes, args,
+                                     NULL, true, 0);
+    }
+    else
+    {
+        appendStringInfo(&query, "SELECT id FROM %s", nodes_table);
+        ret = SPI_execute(query.data, true, 0);
+    }
+    pfree(query.data);
+
+    if (ret != SPI_OK_SELECT)
+        ereport(ERROR,
+            (errcode(ERRCODE_INTERNAL_ERROR),
+             errmsg("igraph MATCH: bare node enumeration failed (ret=%d)", ret)));
+
+    nrows    = SPI_processed;
+    node_ids = (int64 *) palloc(nrows * sizeof(int64));
+    for (i = 0; i < nrows; i++)
+    {
+        bool isnull;
+        node_ids[i] = DatumGetInt64(
+            SPI_getbinval(SPI_tuptable->vals[i],
+                          SPI_tuptable->tupdesc, 1, &isnull));
+    }
+
+    /* StringInfo, not JsonbParseState — SPI memory context switches
+     * corrupt a JsonbParseState across calls (same rationale as
+     * exec_match_ctx/exec_path). */
+    StringInfoData json_buf;
+    initStringInfo(&json_buf);
+    appendStringInfoChar(&json_buf, '[');
+
+    bool first_result = true;
+    for (i = 0; i < nrows; i++)
+    {
+        int64       nid = node_ids[i];
+        char       *label = NULL;
+        bool        isnull;
+        int         lret;
+        StringInfoData label_query;
+        bool        node_passes_filter = true;
+        IgraphCond *cond;
+
+        /* Each candidate resolves the src alias to its own id — there
+         * is no anchor/traversal target distinction in a bare match,
+         * so pass start_id=-1 regardless of how the candidate list
+         * above was narrowed. */
+        cond = m->where;
+        while (cond && node_passes_filter)
+        {
+            int64 cond_id;
+            if (resolve_match_alias_id(m, cond->alias, -1, nid, &cond_id))
+            {
+                if (!evaluate_condition(cond, cond_id, cond->alias, ctx))
+                    node_passes_filter = false;
+            }
+            cond = cond->next;
+        }
+        if (!node_passes_filter)
+            continue;
+
+        initStringInfo(&label_query);
+        appendStringInfo(&label_query,
+            "SELECT nl.name FROM %s n JOIN %s nl ON nl.id = n.label "
+            "WHERE n.id = $1",
+            nodes_table, node_labels_table);
+        {
+            Oid   la[]    = { INT8OID };
+            Datum largs[] = { Int64GetDatum(nid) };
+            lret = SPI_execute_with_args(label_query.data,
+                                          1, la, largs, NULL, true, 1);
+            if (lret == SPI_OK_SELECT && SPI_processed > 0)
+                label = TextDatumGetCString(
+                    SPI_getbinval(SPI_tuptable->vals[0],
+                                  SPI_tuptable->tupdesc, 1, &isnull));
+        }
+        pfree(label_query.data);
+
+        if (!first_result)
+            appendStringInfoChar(&json_buf, ',');
+        first_result = false;
+
+        if (m->returns)
+        {
+            IgraphReturnField *rf;
+            bool               first_field = true;
+
+            appendStringInfoChar(&json_buf, '{');
+            for (rf = m->returns; rf; rf = rf->next)
+            {
+                int64 alias_id;
+                bool  resolved = resolve_match_alias_id(m, rf->alias, -1, nid, &alias_id);
+
+                if (!first_field)
+                    appendStringInfoChar(&json_buf, ',');
+                first_field = false;
+
+                appendStringInfoChar(&json_buf, '"');
+                appendStringInfoString(&json_buf, rf->alias);
+                if (rf->prop)
+                {
+                    appendStringInfoChar(&json_buf, '.');
+                    appendStringInfoString(&json_buf, rf->prop);
+                }
+                appendStringInfoString(&json_buf, "\":");
+
+                if (!resolved)
+                {
+                    appendStringInfoString(&json_buf, "null");
+                }
+                else if (!rf->prop || strcmp(rf->prop, "id") == 0)
+                {
+                    appendStringInfo(&json_buf, INT64_FORMAT, alias_id);
+                }
+                else
+                {
+                    IgraphValue v = get_node_property_value(alias_id, rf->prop, ctx);
+                    append_igraph_value_json(&json_buf, v);
+                }
+            }
+            appendStringInfoChar(&json_buf, '}');
+        }
+        else
+        {
+            appendStringInfo(&json_buf, "{\"id\":%ld", nid);
+            if (label) {
+                appendStringInfoString(&json_buf, ",\"label\":");
+                escape_json(&json_buf, label);
+            }
+            appendStringInfoChar(&json_buf, '}');
+        }
+    }
+
+    appendStringInfoChar(&json_buf, ']');
+
+    Datum jsonb_datum;
+    Jsonb *result;
+
+    if (first_result) {
+        jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum("{}"));
+    } else {
+        jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json_buf.data));
+    }
+    result = DatumGetJsonbP(jsonb_datum);
+
     pfree(json_buf.data);
     pfree(node_ids);
     pfree(nodes_table);

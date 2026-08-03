@@ -74,7 +74,7 @@ SELECT graph_set_property(:alice_id, 'ext_id', 3::smallint,
 SELECT graph_get_node_properties(:alice_id);
                                                          graph_get_node_properties                                                         
 -------------------------------------------------------------------------------------------------------------------------------------------
- {"age": "00", "name": "Alice", "score": "013a", "ext_id": "550e8400-e29b-41d4-a716-446655440000", "joined": 1767225600, "verified": true}
+ {"age": "2a", "name": "Alice", "score": "013a", "ext_id": "550e8400-e29b-41d4-a716-446655440000", "joined": 1767225600, "verified": true}
 (1 row)
 
 -- graph_get_property: raw BYTEA, undecoded — exact equality against the

@@ -248,6 +248,22 @@ stmt_match:
             s->match.returns = $6;
             $$ = s;
         }
+    | TK_MATCH node_pattern
+      where_clause
+      return_clause
+        {
+            /* Bare single-node match: MATCH (n) / MATCH (n:Label), no
+             * relationship required. rel/dst stay NULL — exec_match_ctx
+             * dispatches this shape to exec_match_bare_ctx() instead of
+             * treating it as a src-rel-dst traversal. */
+            IgraphStmt *s = make_stmt(STMT_MATCH);
+            s->match.src     = $2;
+            s->match.rel     = NULL;
+            s->match.dst     = NULL;
+            s->match.where   = $3;
+            s->match.returns = $4;
+            $$ = s;
+        }
     ;
 
 /* ── Node pattern: (alias:Label) or (alias) or (:Label) ── */

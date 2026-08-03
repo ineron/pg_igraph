@@ -14,7 +14,7 @@ PG_CPPFLAGS  = -I$(shell $(PG_CONFIG) --includedir-server) -I.
 # inside pgxs.mk is evaluated at parse time, not at rule-execution time.
 REGRESS = 00_setup 01_node_edge_crud 02_traversal_and_path 03_create_delete_set_ddl \
           04_match_where_return 05_match_prefixed 06_query_params \
-          07_known_bugs_and_regressions
+          07_known_bugs_and_regressions 08_bare_match
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
