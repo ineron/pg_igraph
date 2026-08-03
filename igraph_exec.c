@@ -19,6 +19,7 @@
 #include "igraph_query.h"
 
 /* ── Forward declarations ──────────────────────── */
+static char *build_table_name(const char *base_name, IgraphExecContext *ctx);
 static Jsonb *exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx);
 static Jsonb *exec_path_ctx(IgraphStmtPath *p, IgraphExecContext *ctx);
 static Jsonb *exec_create_node_ctx(IgraphStmtCreateNode *cn, IgraphExecContext *ctx);
@@ -512,14 +513,45 @@ get_node_property_value(int64 node_id, const char *prop_name, IgraphExecContext 
      * decode path this project already trusts elsewhere
      * (decode_node_properties_jsonb), so pull the single field out of its
      * JSONB result with ->> instead of decoding by hand here.
+     *
+     * That decode path is correct for TEXT/BOOL/UUID/DATE/COMPLEX, but for
+     * ILIB_OP_NUMERIC (op_id 0x02 — bigint/numeric properties) it
+     * deliberately renders a hex string of the raw GMP payload (see
+     * decode_node_properties_jsonb/ilib_field_to_jsonb in pg_igraph.c) —
+     * the right contract for graph_get_node_properties() itself, but
+     * re-parsing that hex string here with strtoll()/strtod() as if it
+     * were base-10 (as this function used to) silently produces a
+     * plausible-looking, wrong value with no relationship to the real
+     * magnitude (e.g. age=30 -> "00" -> 0). So the property's raw header
+     * byte (op_id, params/scale) is fetched alongside the already-decoded
+     * text in the same query, and a NUMERIC property is routed to
+     * pg_ilib's own bytea_to_numeric() instead — the only decoder that
+     * actually understands the scale + GMP payload. Non-numeric types
+     * keep using the existing, already-correct ->> text unchanged.
      */
+    char *node_properties_table = build_table_name("node_properties", ctx);
+    char *property_types_table  = build_table_name("property_types", ctx);
     StringInfoData query;
     initStringInfo(&query);
 
     if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0) {
-        appendStringInfo(&query, "SELECT graph_get_node_properties($1, $3) ->> $2");
+        appendStringInfo(&query,
+            "SELECT graph_get_node_properties($1, $3) ->> $2, "
+            "CASE WHEN octet_length(np.value) >= 2 THEN get_byte(np.value,0) >> 4 END, "
+            "CASE WHEN octet_length(np.value) >= 2 THEN ((get_byte(np.value,0) & 15) << 8) | get_byte(np.value,1) END, "
+            "np.value "
+            "FROM %s np JOIN %s pt ON pt.id = np.prop_id "
+            "WHERE np.node_id = $1 AND pt.name = $2",
+            node_properties_table, property_types_table);
     } else {
-        appendStringInfo(&query, "SELECT graph_get_node_properties($1) ->> $2");
+        appendStringInfo(&query,
+            "SELECT graph_get_node_properties($1) ->> $2, "
+            "CASE WHEN octet_length(np.value) >= 2 THEN get_byte(np.value,0) >> 4 END, "
+            "CASE WHEN octet_length(np.value) >= 2 THEN ((get_byte(np.value,0) & 15) << 8) | get_byte(np.value,1) END, "
+            "np.value "
+            "FROM %s np JOIN %s pt ON pt.id = np.prop_id "
+            "WHERE np.node_id = $1 AND pt.name = $2",
+            node_properties_table, property_types_table);
     }
 
     /* Execute query */
@@ -541,28 +573,71 @@ get_node_property_value(int64 node_id, const char *prop_name, IgraphExecContext 
     }
 
     if (ret == SPI_OK_SELECT && SPI_processed > 0) {
-        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-        if (!isnull) {
-            char *prop_value = TextDatumGetCString(d);
+        HeapTuple tup = SPI_tuptable->vals[0];
+        TupleDesc td  = SPI_tuptable->tupdesc;
+        bool op_isnull;
+        int32 op_id = DatumGetInt32(SPI_getbinval(tup, td, 2, &op_isnull));
 
-            /* Try to determine the type and convert */
-            if (prop_value) {
-                /* Try to parse as integer first */
-                char *endptr;
-                long long_val = strtoll(prop_value, &endptr, 10);
-                if (*endptr == '\0') {
-                    result.type = IGRAPH_VAL_INT;
-                    result.ival = long_val;
-                } else {
-                    /* Try to parse as float */
-                    double double_val = strtod(prop_value, &endptr);
+        if (!op_isnull && op_id == 0x02 /* ILIB_OP_NUMERIC, see pg_igraph.c */) {
+            bool  params_isnull, raw_isnull;
+            int32 params = DatumGetInt32(SPI_getbinval(tup, td, 3, &params_isnull));
+            Datum raw_d  = SPI_getbinval(tup, td, 4, &raw_isnull);
+
+            if (!raw_isnull) {
+                /*
+                 * Copy the bytea out of SPI's memory context before the
+                 * nested SPI_execute_with_args() below overwrites the
+                 * global SPI_tuptable — same hazard documented in
+                 * decode_node_properties_jsonb()'s IMPORTANT #1.
+                 */
+                bytea *raw_bv = DatumGetByteaPCopy(raw_d);
+                Oid    nargtypes[] = { BYTEAOID };
+                Datum  nargs[]     = { PointerGetDatum(raw_bv) };
+                int    nret = SPI_execute_with_args(
+                    "SELECT bytea_to_numeric($1)::text",
+                    1, nargtypes, nargs, NULL, true, 1);
+
+                if (nret == SPI_OK_SELECT && SPI_processed > 0) {
+                    bool  nisnull;
+                    Datum nd = SPI_getbinval(SPI_tuptable->vals[0],
+                                              SPI_tuptable->tupdesc, 1, &nisnull);
+                    if (!nisnull) {
+                        char *numeric_text = TextDatumGetCString(nd);
+
+                        if (!params_isnull && params == 0) {
+                            result.type = IGRAPH_VAL_INT;
+                            result.ival = strtoll(numeric_text, NULL, 10);
+                        } else {
+                            result.type = IGRAPH_VAL_FLOAT;
+                            result.fval = strtod(numeric_text, NULL);
+                        }
+                    }
+                }
+            }
+        } else {
+            Datum d = SPI_getbinval(tup, td, 1, &isnull);
+            if (!isnull) {
+                char *prop_value = TextDatumGetCString(d);
+
+                /* Try to determine the type and convert */
+                if (prop_value) {
+                    /* Try to parse as integer first */
+                    char *endptr;
+                    long long_val = strtoll(prop_value, &endptr, 10);
                     if (*endptr == '\0') {
-                        result.type = IGRAPH_VAL_FLOAT;
-                        result.fval = double_val;
+                        result.type = IGRAPH_VAL_INT;
+                        result.ival = long_val;
                     } else {
-                        /* Treat as string */
-                        result.type = IGRAPH_VAL_STRING;
-                        result.sval = pstrdup(prop_value);
+                        /* Try to parse as float */
+                        double double_val = strtod(prop_value, &endptr);
+                        if (*endptr == '\0') {
+                            result.type = IGRAPH_VAL_FLOAT;
+                            result.fval = double_val;
+                        } else {
+                            /* Treat as string */
+                            result.type = IGRAPH_VAL_STRING;
+                            result.sval = pstrdup(prop_value);
+                        }
                     }
                 }
             }

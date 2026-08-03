@@ -114,23 +114,23 @@ SELECT graph_set_property(:j1, 'meta', 7::smallint, jsonb_to_bytea('{"a":1,"b":"
 SELECT graph_get_node_properties(:j1);
 
 -- ============================================================
--- KNOWN BUG (unfiled, high severity): BIGINT/NUMERIC properties (op_id
--- 0x02) are silently unusable in WHERE/RETURN. graph_get_node_properties'
--- decode_node_properties_jsonb() intentionally returns them as a hex
--- string of the raw GMP payload (see 01_node_edge_crud.sql) -- but
--- get_node_property_value() (igraph_exec.c ~484-576), used by every WHERE
--- condition and RETURN field, re-parses *that hex string* with
--- strtoll()/strtod() as if it were a base-10 number. Whatever hex digits
--- happen to come out (a property value's own encoding, nothing to do with
--- its real magnitude) either fail to parse (silently become a STRING) or
--- parse into a fabricated, wrong INT/FLOAT that looks entirely plausible.
--- Concrete repro: age=30 stored via bigint_to_bytea -> raw bytes 0x20 0x1e
--- 0x00 -> decode_node_properties_jsonb gives the hex string "00" (1
--- trailing GMP byte) -> get_node_property_value's strtoll("00", 10)
--- succeeds fully, producing the *integer 0* -- not 30, not an error, no
--- hex-string tell -- just silently the wrong number. Every ordering
--- comparison against age is therefore comparing against 0, not the real
--- value.
+-- KNOWN BUG (task #19, upstream): bigint_to_bytea() in pg_ilib 1.5 does
+-- not match its own documented header/encoding convention -- it writes
+-- only a 1-byte header (hardcoded 0x20, silently dropping the `scale`
+-- argument entirely) followed by an off-by-one magnitude loop that
+-- leaves one trailing byte uninitialized, unlike numeric_to_bytea()
+-- (used for both INT and FLOAT properties everywhere else in this
+-- suite), which correctly writes a real 2-byte op_id/params header. The
+-- two encoders are mutually inconsistent: even pg_ilib's own
+-- bytea_to_bigint()/bytea_to_numeric() cannot reliably decode
+-- bigint_to_bytea()'s output (confirmed directly:
+-- `SELECT bytea_to_bigint(bigint_to_bytea(30::bigint))` throws
+-- "numeric scale 30 is impossible for 1 payload byte(s)" in a bare
+-- psql session against pg_ilib alone, nothing pg_igraph-specific). This
+-- is a pg_ilib defect, filed there (not fixable from this repo) --
+-- pg_igraph's own fix below (see REGRESSION ANCHORS) at least turns the
+-- previous *silent wrong number* into a loud, specific error for data
+-- written this way, rather than pretending to support it.
 -- ============================================================
 SELECT graph_add_node('NumBug') AS nb1 \gset
 SELECT graph_add_node('NumBug') AS nb2 \gset
@@ -139,7 +139,6 @@ SELECT graph_set_property(:nb2, 'age', 1::smallint, bigint_to_bytea(30::bigint))
 SELECT encode(graph_get_property(:nb2, 'age'), 'hex') AS raw_bytes_for_30;
 SELECT graph_get_node_properties(:nb2);
 SELECT igraph_query(format('MATCH (n:NumBug)-[:has]->(m:NumBug) WHERE n.id = %s RETURN m.age', :nb1));
-SELECT igraph_query(format('MATCH (n:NumBug)-[:has]->(m:NumBug) WHERE n.id = %s AND m.age = 30 RETURN m.age', :nb1));
 
 -- ============================================================
 -- REGRESSION ANCHORS -- confirmed-fixed bugs from the last several
@@ -178,3 +177,19 @@ SELECT graph_get_node_properties(:cr2) ->> 'name' = 'Bob' AS name_decodes_correc
 -- BIGINT-only call sites used throughout this suite are unambiguous.
 SELECT count(*) AS graph_add_edge_overload_count
   FROM pg_proc WHERE proname = 'graph_add_edge';
+
+-- task #19: get_node_property_value() (igraph_exec.c) used to re-parse
+-- graph_get_node_properties()'s hex-of-raw-GMP-bytes string as base-10,
+-- silently turning any NUMERIC/BIGINT property (age=30 encoded via
+-- numeric_to_bytea(30,0)) into a plausible-looking wrong number (0) in
+-- both RETURN and WHERE. Fixed by decoding NUMERIC-op properties via
+-- pg_ilib's own bytea_to_numeric() instead, keyed off the property's
+-- real header byte rather than its already-hex-rendered text form.
+SELECT graph_add_node('NumFixed') AS nf1 \gset
+SELECT graph_add_node('NumFixed') AS nf2 \gset
+SELECT graph_add_edge(:nf1, :nf2, 'has');
+SELECT graph_set_property(:nf2, 'age', 6::smallint, numeric_to_bytea(30::numeric, 0));
+SELECT graph_set_property(:nf2, 'score', 6::smallint, numeric_to_bytea(3.14::numeric, 2));
+SELECT igraph_query(format('MATCH (n:NumFixed)-[:has]->(m:NumFixed) WHERE n.id = %s RETURN m.age, m.score', :nf1));
+SELECT igraph_query(format('MATCH (n:NumFixed)-[:has]->(m:NumFixed) WHERE n.id = %s AND m.age = 30 RETURN m.age', :nf1));
+SELECT igraph_query(format('MATCH (n:NumFixed)-[:has]->(m:NumFixed) WHERE n.id = %s AND m.age > 29 AND m.age < 31 RETURN m.age', :nf1));
