@@ -1,0 +1,106 @@
+-- igraph_query() overloads and &data.field parameter resolution
+-- (igraph_resolve_param, igraph_query_func.c ~25-106; resolve_value,
+-- igraph_exec.c ~470-478 -- only wired up when a json_params context
+-- exists, i.e. only through the 3-arg overload).
+SELECT graph_add_node('Param') AS n1 \gset
+SELECT graph_add_node('Param') AS n2 \gset
+SELECT graph_add_edge(:n1, :n2, 'rel');
+ graph_add_edge 
+----------------
+ 
+(1 row)
+
+SELECT graph_set_property(:n1, 'name', 2::smallint, str_to_bytea('Neo'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+-- ============================================================
+-- 1-arg igraph_query(query) -- always the default graph, ctx=NULL,
+-- so &param literals would resolve to nothing (not exercised: no WHERE
+-- clause in this repo's grammar can reach a MATCH without an anchor
+-- literal or param in a way that matters here).
+-- ============================================================
+SELECT igraph_query('CREATE (n:Param)');
+          igraph_query           
+---------------------------------
+ {"status": "ok", "node_id": 23}
+(1 row)
+
+-- ============================================================
+-- 3-arg igraph_query(table_prefix, query, json_params) -- '' prefix
+-- targets the default graph same as the 1-arg form, but wires up params.
+-- ============================================================
+-- integral JSON number -> IGRAPH_VAL_INT
+SELECT igraph_query('',
+  format('MATCH (n:Param)-[:rel]->(m:Param) WHERE n.id = %s AND m.id = &data.target RETURN m.id', :n1),
+  format('{"data":{"target": %s}}', :n2)::jsonb);
+  igraph_query  
+----------------
+ [{"m.id": 22}]
+(1 row)
+
+-- string param against a TEXT property
+SELECT igraph_query('',
+  format('MATCH (n:Param)-[:rel]->(m:Param) WHERE n.id = %s AND n.name = &data.nm RETURN n.name', :n1),
+  '{"data":{"nm":"Neo"}}'::jsonb);
+    igraph_query     
+---------------------
+ [{"n.name": "Neo"}]
+(1 row)
+
+-- missing key in the params path -> IGRAPH_VAL_NULL -> "=" never matches
+SELECT igraph_query('',
+  format('MATCH (n:Param)-[:rel]->(m:Param) WHERE n.id = %s AND m.id = &data.missing RETURN m.id', :n1),
+  '{"data":{}}'::jsonb);
+ igraph_query 
+--------------
+ {}
+(1 row)
+
+-- non-integral JSON number -> IGRAPH_VAL_FLOAT, compared against an
+-- int property: no type coercion, so never equal
+SELECT igraph_query('',
+  format('MATCH (n:Param)-[:rel]->(m:Param) WHERE n.id = %s AND m.id = &data.f RETURN m.id', :n1),
+  '{"data":{"f":3.5}}'::jsonb);
+ igraph_query 
+--------------
+ {}
+(1 row)
+
+-- JSON bool / JSON null params against a TEXT property: cross-type,
+-- "=" is always false (compare_values' type-mismatch fallback)
+SELECT igraph_query('',
+  format('MATCH (n:Param)-[:rel]->(m:Param) WHERE n.id = %s AND n.name = &data.b RETURN n.name', :n1),
+  '{"data":{"b":true}}'::jsonb);
+ igraph_query 
+--------------
+ {}
+(1 row)
+
+SELECT igraph_query('',
+  format('MATCH (n:Param)-[:rel]->(m:Param) WHERE n.id = %s AND n.name = &data.z RETURN n.name', :n1),
+  '{"data":{"z":null}}'::jsonb);
+ igraph_query 
+--------------
+ {}
+(1 row)
+
+-- ============================================================
+-- json_params may be NULL outright (non-STRICT function, explicit NULL
+-- check only on table_prefix/query -- igraph_query_func.c ~246-259)
+-- ============================================================
+SELECT igraph_query('', format('MATCH (n:Param)-[:rel]->(m:Param) WHERE n.id = %s RETURN m.id', :n1), NULL::jsonb);
+  igraph_query  
+----------------
+ [{"m.id": 22}]
+(1 row)
+
+-- ============================================================
+-- table_prefix / query NULL -> hard errors (igraph_query_func.c ~246-255)
+-- ============================================================
+SELECT igraph_query(NULL, 'MATCH (n:Param)-[:rel]->(m:Param) WHERE n.id = 1', NULL::jsonb);
+ERROR:  table_prefix cannot be NULL
+SELECT igraph_query('', NULL, NULL::jsonb);
+ERROR:  query cannot be NULL

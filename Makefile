@@ -9,8 +9,20 @@ override with_llvm = no
 
 PG_CPPFLAGS  = -I$(shell $(PG_CONFIG) --includedir-server) -I.
 
+# ── Regression tests (pg_regress via PGXS) ──────
+# REGRESS must be set before `include $(PGXS)` — the ifdef REGRESS block
+# inside pgxs.mk is evaluated at parse time, not at rule-execution time.
+REGRESS = 00_setup 01_node_edge_crud 02_traversal_and_path 03_create_delete_set_ddl \
+          04_match_where_return 05_match_prefixed 06_query_params \
+          07_known_bugs_and_regressions
+
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Own dedicated regression DB — never touches the shared graph_test instance,
+# and never touches the generic contrib_regression DB other extensions may use.
+CONTRIB_TESTDB = pg_igraph_regress
+REGRESS_OPTS  += --inputdir=test
 
 # ── Generated sources ────────────────────────────
 igraph_lexer.c igraph_lexer.h: igraph_lexer.l igraph_parser.h

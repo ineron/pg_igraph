@@ -1,0 +1,193 @@
+-- Base API: graph_add_node / graph_add_edge / graph_delete_node /
+-- graph_set_property / graph_get_property / graph_get_node_properties /
+-- graph_delete_property, over the default (unprefixed) graph only.
+-- Prefixed-graph variants of these same calls are covered in
+-- 05_match_prefixed.sql (which also exercises node/edge CRUD, not just MATCH).
+-- ============================================================
+-- graph_add_node / graph_add_edge
+-- ============================================================
+SELECT graph_add_node('User') AS alice_id \gset
+SELECT graph_add_node('User') AS bob_id \gset
+SELECT graph_add_node('Product') AS widget_id \gset
+SELECT graph_add_edge(:alice_id, :bob_id, 'follows');
+ graph_add_edge 
+----------------
+ 
+(1 row)
+
+SELECT graph_add_edge(:alice_id, :widget_id, 'likes');
+ graph_add_edge 
+----------------
+ 
+(1 row)
+
+-- ============================================================
+-- graph_set_property / graph_get_node_properties: all 6 primitives
+--
+-- NOTE on NUMERIC/BIGINT (op_id 0x02, pg_igraph.c ~1749/2139-2180):
+-- both share one wire op and decode_node_properties_jsonb() currently
+-- returns them as a *hex string* of the raw GMP payload bytes, not a JSON
+-- number — this is documented as deliberate-for-now in the source ("client
+-- decodes with pg_ilib bytea_to_numeric()"). Pinning that here rather than
+-- asserting a JSON number, since that's what the code actually does today.
+-- TIMESTAMP (op 0x04) by contrast *does* decode to a real JSON number
+-- (epoch seconds) — an asymmetry worth knowing about, not a bug to fix here.
+-- ============================================================
+SELECT graph_set_property(:alice_id, 'name', 2::smallint, str_to_bytea('Alice'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:alice_id, 'age', 1::smallint, bigint_to_bytea(42::bigint));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:alice_id, 'verified', 5::smallint, bool_to_bytea(true));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:alice_id, 'score', 6::smallint, numeric_to_bytea(3.14::numeric));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:alice_id, 'joined', 4::smallint,
+       timestamp_to_bytea(extract(epoch from timestamp '2026-01-01 00:00:00')::bigint));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:alice_id, 'ext_id', 3::smallint,
+       uuid_to_bytea('550e8400-e29b-41d4-a716-446655440000'::uuid));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_get_node_properties(:alice_id);
+                                                         graph_get_node_properties                                                         
+-------------------------------------------------------------------------------------------------------------------------------------------
+ {"age": "00", "name": "Alice", "score": "013a", "ext_id": "550e8400-e29b-41d4-a716-446655440000", "joined": 1767225600, "verified": true}
+(1 row)
+
+-- graph_get_property: raw BYTEA, undecoded — exact equality against the
+-- same encoder call proves it round-trips the bytes untouched.
+SELECT graph_get_property(:alice_id, 'name') = str_to_bytea('Alice') AS name_bytes_roundtrip;
+ name_bytes_roundtrip 
+----------------------
+ t
+(1 row)
+
+-- ============================================================
+-- graph_delete_property
+-- ============================================================
+SELECT graph_delete_property(:alice_id, 'verified');
+ graph_delete_property 
+-----------------------
+ 
+(1 row)
+
+SELECT graph_get_node_properties(:alice_id) ? 'verified' AS verified_still_present;
+ verified_still_present 
+------------------------
+ f
+(1 row)
+
+-- ============================================================
+-- graph_delete_node — cascades edges (both directions) and properties
+-- ============================================================
+SELECT graph_add_node('User') AS carol_id \gset
+SELECT graph_add_edge(:carol_id, :alice_id, 'follows');
+ graph_add_edge 
+----------------
+ 
+(1 row)
+
+SELECT graph_set_property(:carol_id, 'name', 2::smallint, str_to_bytea('Carol'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_delete_node(:carol_id);
+ graph_delete_node 
+-------------------
+ 
+(1 row)
+
+SELECT count(*) AS carol_out_edges FROM edges WHERE from_id = :carol_id;
+ carol_out_edges 
+-----------------
+               0
+(1 row)
+
+SELECT count(*) AS carol_in_edges  FROM edges WHERE to_id   = :carol_id;
+ carol_in_edges 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS carol_props     FROM node_properties WHERE node_id = :carol_id;
+ carol_props 
+-------------
+           0
+(1 row)
+
+SELECT count(*) AS carol_node_row  FROM nodes WHERE id = :carol_id;
+ carol_node_row 
+----------------
+              0
+(1 row)
+
+-- ============================================================
+-- INT-overload wrapper forms (pg_igraph--1.1.sql casts int->bigint) —
+-- bare integer literals are int4 already, so these dispatch to the
+-- INT-arg wrapper overloads without any explicit cast.
+-- ============================================================
+SELECT graph_add_node('User') AS dave_id \gset
+SELECT graph_add_node('User') AS erin_id \gset
+-- dave_id/erin_id are session \gset bigint values; cast down to int4 to
+-- actually exercise the INT overloads (they're small in a fresh test db).
+SELECT graph_add_edge(:dave_id::int, :erin_id::int, 'follows');
+ graph_add_edge 
+----------------
+ 
+(1 row)
+
+SELECT graph_set_property(:dave_id::int, 'name', 2::smallint, str_to_bytea('Dave'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_get_property(:dave_id::int, 'name');
+ graph_get_property 
+--------------------
+ \x100044617665
+(1 row)
+
+SELECT graph_get_node_properties(:dave_id::int);
+ graph_get_node_properties 
+---------------------------
+ {"name": "Dave"}
+(1 row)
+
+SELECT graph_delete_node(:erin_id::int);
+ graph_delete_node 
+-------------------
+ 
+(1 row)
+
+SELECT count(*) AS erin_node_row FROM nodes WHERE id = :erin_id;
+ erin_node_row 
+---------------
+             0
+(1 row)
+

@@ -1,0 +1,50 @@
+-- MATCH (and CRUD) over prefixed graphs, exercising both table_prefix
+-- shapes build_table_name() supports (pg_igraph.c ~345): a flat prefix
+-- with no dot ('shop_') and a schema-qualified prefix ('social.social_').
+-- Requires the 3-arg igraph_query(table_prefix, query, json_params)
+-- overload -- the 1-arg form always targets the default unprefixed graph.
+
+-- ============================================================
+-- Flat prefix: 'shop_' -> shop_nodes, shop_edges, ... (00_setup.sql)
+-- ============================================================
+SELECT graph_add_node('Customer', 'shop_') AS c1 \gset
+SELECT graph_add_node('Customer', 'shop_') AS c2 \gset
+SELECT graph_add_edge(:c1, :c2, 'refers', 'shop_');
+SELECT graph_set_property(:c1, 'name', 2::smallint, str_to_bytea('ShopAlice'), table_prefix => 'shop_');
+SELECT graph_set_property(:c2, 'name', 2::smallint, str_to_bytea('ShopBob'),   table_prefix => 'shop_');
+
+SELECT igraph_query('shop_',
+  format('MATCH (n:Customer)-[:refers]->(m:Customer) WHERE n.id = %s RETURN m.name', :c1),
+  NULL::jsonb);
+SELECT igraph_query('shop_',
+  format('MATCH (n:Customer)-[:refers]->(m:Customer) WHERE n.id = %s', :c1),
+  NULL::jsonb);
+
+-- CREATE via query language, scoped to the prefixed graph
+SELECT igraph_query('shop_', 'CREATE (n:Customer)', NULL::jsonb);
+SELECT count(*) AS shop_node_count FROM shop_nodes;
+
+-- ============================================================
+-- Schema-qualified prefix: 'social.social_' ->
+-- "social"."social_nodes", "social"."social_edges", ...
+-- ============================================================
+SELECT graph_add_node('Member', 'social.social_') AS s1 \gset
+SELECT graph_add_node('Member', 'social.social_') AS s2 \gset
+SELECT graph_add_edge(:s1, :s2, 'friends', 'social.social_');
+SELECT graph_set_property(:s1, 'name', 2::smallint, str_to_bytea('SocAlice'), table_prefix => 'social.social_');
+SELECT graph_set_property(:s2, 'name', 2::smallint, str_to_bytea('SocBob'),   table_prefix => 'social.social_');
+
+SELECT igraph_query('social.social_',
+  format('MATCH (n:Member)-[:friends]->(m:Member) WHERE n.id = %s RETURN m.name', :s1),
+  NULL::jsonb);
+SELECT igraph_query('social.social_',
+  format('MATCH (n:Member)-[:friends]->(m:Member) WHERE n.id = %s', :s1),
+  NULL::jsonb);
+
+-- ============================================================
+-- Cross-graph isolation: the default graph has no 'Customer' label /
+-- 'refers' rel_type of its own -- querying it through the 1-arg
+-- (unprefixed) form for the shop_ fixture's ids is a hard error, not
+-- silently-wrong data.
+-- ============================================================
+SELECT igraph_query(format('MATCH (n:Customer)-[:refers]->(m:Customer) WHERE n.id = %s', :c1));

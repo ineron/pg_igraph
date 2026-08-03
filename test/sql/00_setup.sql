@@ -1,0 +1,145 @@
+-- pg_igraph regression suite: schema bootstrap.
+--
+-- CREATE EXTENSION pg_igraph only declares functions (see pg_igraph--1.1.sql) --
+-- it creates no tables. The real DDL normally comes from init_graph.sh's bash
+-- heredoc; this file is a hand-transcribed, stripped-down copy of it (no
+-- edge_properties/graph_meta tables and no non-PK indexes, since nothing in
+-- pg_igraph.c/igraph_exec.c reads those -- see init_graph.sh for the full
+-- production schema used by real deployments).
+--
+-- Three graphs are set up, matching the three table_prefix shapes
+-- build_table_name() supports (pg_igraph.c ~345, igraph_exec.c ~683):
+--   1. default graph      -- empty prefix, bare table names in public
+--   2. flat-prefix graph  -- prefix 'shop_' (no dot) -> shop_nodes, shop_edges, ...
+--   3. schema-qualified   -- prefix 'social.social_' -> "social"."social_nodes", ...
+
+CREATE EXTENSION pg_ilib;
+CREATE EXTENSION pg_igraph;
+
+-- ============================================================
+-- Graph 1: default (no prefix)
+-- ============================================================
+CREATE TABLE node_labels (
+  id    SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name  TEXT NOT NULL UNIQUE
+);
+CREATE TABLE rel_types (
+  id    SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name  TEXT NOT NULL UNIQUE
+);
+-- primitive: 1=bigint 2=text 3=uuid 4=timestamp 5=bool 6=numeric 7=jsonb
+CREATE TABLE property_types (
+  id        SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name      TEXT     NOT NULL UNIQUE,
+  primitive SMALLINT NOT NULL CHECK (primitive BETWEEN 1 AND 7),
+  ref_label SMALLINT REFERENCES node_labels(id)
+);
+CREATE TABLE nodes (
+  id    BIGINT   PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  label SMALLINT NOT NULL REFERENCES node_labels(id)
+);
+CREATE TABLE node_properties (
+  node_id BIGINT   NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  prop_id SMALLINT NOT NULL REFERENCES property_types(id),
+  value   BYTEA    NOT NULL,
+  PRIMARY KEY (node_id, prop_id)
+);
+CREATE TABLE edges (
+  from_id   BIGINT   NOT NULL,
+  to_id     BIGINT   NOT NULL,
+  rel_type  SMALLINT NOT NULL REFERENCES rel_types(id),
+  direction BOOL     NOT NULL DEFAULT TRUE,
+  data      BYTEA
+) PARTITION BY HASH (from_id);
+CREATE TABLE edges_p0 PARTITION OF edges FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+CREATE TABLE edges_p1 PARTITION OF edges FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+
+-- complex types are never prefix-aware (graph_add_complex_type/_field/
+-- graph_get_complex_fields hardcode unqualified "complex_types" /
+-- "complex_type_fields", pg_igraph.c:1812-1859) -- one shared registry only.
+CREATE TABLE complex_types (
+  id    SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name  TEXT NOT NULL UNIQUE
+);
+CREATE TABLE complex_type_fields (
+  type_id    SMALLINT NOT NULL REFERENCES complex_types(id) ON DELETE CASCADE,
+  pos        SMALLINT NOT NULL CHECK (pos >= 0),
+  field_name TEXT NOT NULL,
+  PRIMARY KEY (type_id, pos)
+);
+
+-- ============================================================
+-- Graph 2: flat prefix 'shop_' (same schema, no dot in the prefix)
+-- ============================================================
+CREATE TABLE shop_node_labels (
+  id    SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name  TEXT NOT NULL UNIQUE
+);
+CREATE TABLE shop_rel_types (
+  id    SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name  TEXT NOT NULL UNIQUE
+);
+CREATE TABLE shop_property_types (
+  id        SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name      TEXT     NOT NULL UNIQUE,
+  primitive SMALLINT NOT NULL CHECK (primitive BETWEEN 1 AND 7),
+  ref_label SMALLINT REFERENCES shop_node_labels(id)
+);
+CREATE TABLE shop_nodes (
+  id    BIGINT   PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  label SMALLINT NOT NULL REFERENCES shop_node_labels(id)
+);
+CREATE TABLE shop_node_properties (
+  node_id BIGINT   NOT NULL REFERENCES shop_nodes(id) ON DELETE CASCADE,
+  prop_id SMALLINT NOT NULL REFERENCES shop_property_types(id),
+  value   BYTEA    NOT NULL,
+  PRIMARY KEY (node_id, prop_id)
+);
+CREATE TABLE shop_edges (
+  from_id   BIGINT   NOT NULL,
+  to_id     BIGINT   NOT NULL,
+  rel_type  SMALLINT NOT NULL REFERENCES shop_rel_types(id),
+  direction BOOL     NOT NULL DEFAULT TRUE,
+  data      BYTEA
+) PARTITION BY HASH (from_id);
+CREATE TABLE shop_edges_p0 PARTITION OF shop_edges FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+CREATE TABLE shop_edges_p1 PARTITION OF shop_edges FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+
+-- ============================================================
+-- Graph 3: schema-qualified prefix 'social.social_'
+-- build_table_name splits on the dot: schema="social", table="social_"||base
+-- ============================================================
+CREATE SCHEMA social;
+CREATE TABLE social.social_node_labels (
+  id    SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name  TEXT NOT NULL UNIQUE
+);
+CREATE TABLE social.social_rel_types (
+  id    SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name  TEXT NOT NULL UNIQUE
+);
+CREATE TABLE social.social_property_types (
+  id        SMALLINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name      TEXT     NOT NULL UNIQUE,
+  primitive SMALLINT NOT NULL CHECK (primitive BETWEEN 1 AND 7),
+  ref_label SMALLINT REFERENCES social.social_node_labels(id)
+);
+CREATE TABLE social.social_nodes (
+  id    BIGINT   PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  label SMALLINT NOT NULL REFERENCES social.social_node_labels(id)
+);
+CREATE TABLE social.social_node_properties (
+  node_id BIGINT   NOT NULL REFERENCES social.social_nodes(id) ON DELETE CASCADE,
+  prop_id SMALLINT NOT NULL REFERENCES social.social_property_types(id),
+  value   BYTEA    NOT NULL,
+  PRIMARY KEY (node_id, prop_id)
+);
+CREATE TABLE social.social_edges (
+  from_id   BIGINT   NOT NULL,
+  to_id     BIGINT   NOT NULL,
+  rel_type  SMALLINT NOT NULL REFERENCES social.social_rel_types(id),
+  direction BOOL     NOT NULL DEFAULT TRUE,
+  data      BYTEA
+) PARTITION BY HASH (from_id);
+CREATE TABLE social.social_edges_p0 PARTITION OF social.social_edges FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+CREATE TABLE social.social_edges_p1 PARTITION OF social.social_edges FOR VALUES WITH (MODULUS 2, REMAINDER 1);
