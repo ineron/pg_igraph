@@ -67,24 +67,6 @@ SELECT graph_get_node_properties(:reftest_id);
 SELECT igraph_query('PATH FROM &data.a TO &data.b VIA rel');
 
 -- ============================================================
--- KNOWN BUG (unfiled, high severity): SET NODE <id> <prop> = <literal>
--- is broken for *every* literal type right now. exec_set_prop_ctx
--- (igraph_exec.c ~1344-1441) builds "SELECT graph_set_property($1,$2,$3,$4)"
--- binding $3 (a type-name string like "int64") and $4 (a decimal-string
--- value) as TEXT -- but the only registered graph_set_property overloads
--- take (SMALLINT primitive, BYTEA value); no (bigint,text,text,text)
--- overload exists. STRING/INT literals hit "function ... does not exist";
--- FLOAT/BOOL/NULL/&param fall through the type switch's unhandled branch
--- to "igraph SET: unsupported value type". There is currently no way to
--- reach a working call through the SET grammar at all.
--- ============================================================
-SELECT graph_add_node('SetTest') AS st1 \gset
-SELECT igraph_query(format('SET NODE %s greeting = ''hello''', :st1));
-SELECT igraph_query(format('SET NODE %s age = 99', :st1));
-SELECT igraph_query(format('SET NODE %s ratio = 3.5', :st1));
-SELECT igraph_query(format('SET NODE %s active = true', :st1));
-
--- ============================================================
 -- KNOWN BUG (unfiled): relationship depth minimum bound is parsed but
 -- never enforced -- exec_match_ctx only ever reads rel->max_depth
 -- (igraph_exec.c:843), never rel->min_depth. *2 (parsed as min=2,max=2,
@@ -193,3 +175,27 @@ SELECT graph_set_property(:nf2, 'score', 6::smallint, numeric_to_bytea(3.14::num
 SELECT igraph_query(format('MATCH (n:NumFixed)-[:has]->(m:NumFixed) WHERE n.id = %s RETURN m.age, m.score', :nf1));
 SELECT igraph_query(format('MATCH (n:NumFixed)-[:has]->(m:NumFixed) WHERE n.id = %s AND m.age = 30 RETURN m.age', :nf1));
 SELECT igraph_query(format('MATCH (n:NumFixed)-[:has]->(m:NumFixed) WHERE n.id = %s AND m.age > 29 AND m.age < 31 RETURN m.age', :nf1));
+
+-- task #18: exec_set_prop_ctx (igraph_exec.c) built
+-- "SELECT graph_set_property($1,$2,$3,$4)" binding a type-name string and
+-- a decimal-string value as TEXT, but the only registered overloads take
+-- (SMALLINT primitive, BYTEA value) -- every literal type failed. Fixed
+-- by encoding through pg_ilib's own str_to_bytea/numeric_to_bytea/
+-- bool_to_bytea and calling the real overload. FLOAT went through a
+-- second bug on the way: a hardcoded scale=2 in the header mismatched the
+-- GMP payload's actual digit count and silently turned 3.5 into 0.35 on
+-- decode -- fixed by deriving the header's scale from scale($1::numeric)
+-- instead of guessing a fixed value.
+SELECT graph_add_node('SetFixed') AS sf1 \gset
+SELECT igraph_query(format('SET NODE %s greeting = ''hello''', :sf1));
+SELECT igraph_query(format('SET NODE %s age = 99', :sf1));
+SELECT igraph_query(format('SET NODE %s ratio = 3.14159', :sf1));
+SELECT igraph_query(format('SET NODE %s active = true', :sf1));
+SELECT pt.name, bytea_to_numeric(np.value) AS decoded
+  FROM node_properties np JOIN property_types pt ON pt.id = np.prop_id
+  WHERE np.node_id = :sf1 AND pt.name IN ('age', 'ratio')
+  ORDER BY pt.name;
+SELECT graph_get_node_properties(:sf1) ->> 'greeting' AS greeting,
+       (graph_get_node_properties(:sf1) ->> 'active')::boolean AS active;
+SELECT igraph_query(format('SET NODE %s greeting = NULL', :sf1));
+SELECT graph_get_node_properties(:sf1) - 'age' - 'ratio' - 'active' AS greeting_deleted;

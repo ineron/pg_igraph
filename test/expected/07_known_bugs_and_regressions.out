@@ -110,35 +110,6 @@ SELECT igraph_query('PATH FROM &data.a TO &data.b VIA rel');
 ERROR:  igraph syntax error: syntax error, unexpected TK_PARAM, expecting TK_INTEGER
 DETAIL:  At column 17 in: PATH FROM &data.a TO &data.b VIA rel
 -- ============================================================
--- KNOWN BUG (unfiled, high severity): SET NODE <id> <prop> = <literal>
--- is broken for *every* literal type right now. exec_set_prop_ctx
--- (igraph_exec.c ~1344-1441) builds "SELECT graph_set_property($1,$2,$3,$4)"
--- binding $3 (a type-name string like "int64") and $4 (a decimal-string
--- value) as TEXT -- but the only registered graph_set_property overloads
--- take (SMALLINT primitive, BYTEA value); no (bigint,text,text,text)
--- overload exists. STRING/INT literals hit "function ... does not exist";
--- FLOAT/BOOL/NULL/&param fall through the type switch's unhandled branch
--- to "igraph SET: unsupported value type". There is currently no way to
--- reach a working call through the SET grammar at all.
--- ============================================================
-SELECT graph_add_node('SetTest') AS st1 \gset
-SELECT igraph_query(format('SET NODE %s greeting = ''hello''', :st1));
-ERROR:  function graph_set_property(bigint, text, text, text) does not exist
-LINE 1: SELECT graph_set_property($1,$2,$3,$4)
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-QUERY:  SELECT graph_set_property($1,$2,$3,$4)
-SELECT igraph_query(format('SET NODE %s age = 99', :st1));
-ERROR:  function graph_set_property(bigint, text, text, text) does not exist
-LINE 1: SELECT graph_set_property($1,$2,$3,$4)
-               ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-QUERY:  SELECT graph_set_property($1,$2,$3,$4)
-SELECT igraph_query(format('SET NODE %s ratio = 3.5', :st1));
-ERROR:  igraph SET: unsupported value type
-SELECT igraph_query(format('SET NODE %s active = true', :st1));
-ERROR:  igraph SET: unsupported value type
--- ============================================================
 -- KNOWN BUG (unfiled): relationship depth minimum bound is parsed but
 -- never enforced -- exec_match_ctx only ever reads rel->max_depth
 -- (igraph_exec.c:843), never rel->min_depth. *2 (parsed as min=2,max=2,
@@ -348,5 +319,69 @@ SELECT igraph_query(format('MATCH (n:NumFixed)-[:has]->(m:NumFixed) WHERE n.id =
   igraph_query   
 -----------------
  [{"m.age": 30}]
+(1 row)
+
+-- task #18: exec_set_prop_ctx (igraph_exec.c) built
+-- "SELECT graph_set_property($1,$2,$3,$4)" binding a type-name string and
+-- a decimal-string value as TEXT, but the only registered overloads take
+-- (SMALLINT primitive, BYTEA value) -- every literal type failed. Fixed
+-- by encoding through pg_ilib's own str_to_bytea/numeric_to_bytea/
+-- bool_to_bytea and calling the real overload. FLOAT went through a
+-- second bug on the way: a hardcoded scale=2 in the header mismatched the
+-- GMP payload's actual digit count and silently turned 3.5 into 0.35 on
+-- decode -- fixed by deriving the header's scale from scale($1::numeric)
+-- instead of guessing a fixed value.
+SELECT graph_add_node('SetFixed') AS sf1 \gset
+SELECT igraph_query(format('SET NODE %s greeting = ''hello''', :sf1));
+   igraph_query   
+------------------
+ {"status": "ok"}
+(1 row)
+
+SELECT igraph_query(format('SET NODE %s age = 99', :sf1));
+   igraph_query   
+------------------
+ {"status": "ok"}
+(1 row)
+
+SELECT igraph_query(format('SET NODE %s ratio = 3.14159', :sf1));
+   igraph_query   
+------------------
+ {"status": "ok"}
+(1 row)
+
+SELECT igraph_query(format('SET NODE %s active = true', :sf1));
+   igraph_query   
+------------------
+ {"status": "ok"}
+(1 row)
+
+SELECT pt.name, bytea_to_numeric(np.value) AS decoded
+  FROM node_properties np JOIN property_types pt ON pt.id = np.prop_id
+  WHERE np.node_id = :sf1 AND pt.name IN ('age', 'ratio')
+  ORDER BY pt.name;
+ name  | decoded 
+-------+---------
+ age   |      99
+ ratio | 3.14159
+(2 rows)
+
+SELECT graph_get_node_properties(:sf1) ->> 'greeting' AS greeting,
+       (graph_get_node_properties(:sf1) ->> 'active')::boolean AS active;
+ greeting | active 
+----------+--------
+ hello    | t
+(1 row)
+
+SELECT igraph_query(format('SET NODE %s greeting = NULL', :sf1));
+   igraph_query   
+------------------
+ {"status": "ok"}
+(1 row)
+
+SELECT graph_get_node_properties(:sf1) - 'age' - 'ratio' - 'active' AS greeting_deleted;
+ greeting_deleted 
+------------------
+ {}
 (1 row)
 

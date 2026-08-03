@@ -294,122 +294,6 @@ exec_delete_edge(IgraphStmtDeleteEdge *de)
 }
 
 /* ================================================================
- * exec_set_prop
- * ================================================================ */
-static Jsonb *
-exec_set_prop(IgraphStmtSetProp *sp)
-{
-    int ret = 0;
-    MemoryContext caller_ctx = CurrentMemoryContext;
-
-    SPI_connect();
-    MemoryContextSwitchTo(caller_ctx);
-    switch (sp->val.type)
-    {
-        case IGRAPH_VAL_STRING:
-        {
-            Oid   ba[]    = { TEXTOID };
-            Datum bargs[] = { CStringGetTextDatum(sp->val.sval) };
-            bool  isnull;
-            Datum bval;
-            bytea *bv;
-            Oid   at[] = { INT8OID, TEXTOID, INT2OID, BYTEAOID };
-            Datum a[4];
-
-            ret = SPI_execute_with_args(
-                "SELECT str_to_bytea($1)", 1, ba, bargs, NULL, true, 1);
-            if (ret != SPI_OK_SELECT || SPI_processed == 0)
-                ereport(ERROR, (errmsg("igraph SET: str_to_bytea failed")));
-
-            bval = SPI_getbinval(SPI_tuptable->vals[0],
-                                 SPI_tuptable->tupdesc, 1, &isnull);
-            bv   = DatumGetByteaPCopy(bval);
-            a[0] = Int64GetDatum(sp->node_id);
-            a[1] = CStringGetTextDatum(sp->prop_name);
-            a[2] = Int16GetDatum(1);
-            a[3] = PointerGetDatum(bv);
-            ret  = SPI_execute_with_args(
-                "SELECT graph_set_property($1,$2,$3::smallint,$4,NULL)",
-                4, at, a, NULL, false, 0);
-            break;
-        }
-
-        case IGRAPH_VAL_INT:
-        case IGRAPH_VAL_FLOAT:
-        {
-            double dval  = (sp->val.type == IGRAPH_VAL_INT)
-                           ? (double) sp->val.ival : sp->val.fval;
-            int    scale = (sp->val.type == IGRAPH_VAL_INT) ? 0 : 2;
-            Oid    ba[]  = { FLOAT8OID, INT4OID };
-            Datum  bargs[] = { Float8GetDatum(dval), Int32GetDatum(scale) };
-            bool   isnull;
-            Datum  bval;
-            bytea *bv;
-            Oid    at[] = { INT8OID, TEXTOID, INT2OID, BYTEAOID };
-            Datum  a[4];
-
-            ret = SPI_execute_with_args(
-                "SELECT numeric_to_bytea($1::numeric,$2)",
-                2, ba, bargs, NULL, true, 1);
-            if (ret != SPI_OK_SELECT || SPI_processed == 0)
-                ereport(ERROR,(errmsg("igraph SET: numeric_to_bytea failed")));
-
-            bval = SPI_getbinval(SPI_tuptable->vals[0],
-                                 SPI_tuptable->tupdesc, 1, &isnull);
-            bv   = DatumGetByteaPCopy(bval);
-            a[0] = Int64GetDatum(sp->node_id);
-            a[1] = CStringGetTextDatum(sp->prop_name);
-            a[2] = Int16GetDatum(2);
-            a[3] = PointerGetDatum(bv);
-            ret  = SPI_execute_with_args(
-                "SELECT graph_set_property($1,$2,$3::smallint,$4,NULL)",
-                4, at, a, NULL, false, 0);
-            break;
-        }
-
-        case IGRAPH_VAL_BOOL:
-        {
-            unsigned char buf[3];
-            bytea *bv;
-            Oid    at[] = { INT8OID, TEXTOID, INT2OID, BYTEAOID };
-            Datum  a[4];
-
-            buf[0] = (0x05 << 4);
-            buf[1] = 0x00;
-            buf[2] = sp->val.bval ? 0x01 : 0x00;
-            bv     = (bytea *) palloc(VARHDRSZ + 3);
-            SET_VARSIZE(bv, VARHDRSZ + 3);
-            memcpy(VARDATA(bv), buf, 3);
-            a[0]   = Int64GetDatum(sp->node_id);
-            a[1]   = CStringGetTextDatum(sp->prop_name);
-            a[2]   = Int16GetDatum(5);
-            a[3]   = PointerGetDatum(bv);
-            ret    = SPI_execute_with_args(
-                "SELECT graph_set_property($1,$2,$3::smallint,$4,NULL)",
-                4, at, a, NULL, false, 0);
-            break;
-        }
-
-        case IGRAPH_VAL_NULL:
-        {
-            Oid   at[] = { INT8OID, TEXTOID };
-            Datum a[]  = {
-                Int64GetDatum(sp->node_id),
-                CStringGetTextDatum(sp->prop_name)
-            };
-            ret = SPI_execute_with_args(
-                "SELECT graph_delete_property($1,$2)",
-                2, at, a, NULL, false, 0);
-            break;
-        }
-    }
-
-    (void) ret;
-    SPI_finish();
-    return wrap_ok_simple();
-}
-
-/* ================================================================
  * exec_get_props
  * ================================================================ */
 static Jsonb *
@@ -1421,89 +1305,151 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
     MemoryContext caller_ctx = CurrentMemoryContext;
     int           ret;
     IgraphValue   resolved_val;
-    const char   *type_name = "text";
+    int16         primitive = 0;
+    bytea        *value_bytea = NULL;
+    bool          isnull;
 
     resolved_val = resolve_value(sp->val, ctx);
-
-    /* Determine type for graph_set_property */
-    switch (resolved_val.type)
-    {
-        case IGRAPH_VAL_INT:    type_name = "int64"; break;
-        case IGRAPH_VAL_FLOAT:  type_name = "float64"; break;
-        case IGRAPH_VAL_STRING: type_name = "text"; break;
-        case IGRAPH_VAL_BOOL:   type_name = "bool"; break;
-        default:                type_name = "text"; break;
-    }
 
     SPI_connect();
     MemoryContextSwitchTo(caller_ctx);
 
-    if (resolved_val.type == IGRAPH_VAL_INT)
+    if (resolved_val.type == IGRAPH_VAL_NULL)
     {
-        char val_str[32];
-        snprintf(val_str, sizeof(val_str), INT64_FORMAT, resolved_val.ival);
+        /* SET ... = NULL means "unset" — graph_delete_property has no
+         * table-prefix-aware overload yet, so refuse rather than
+         * silently deleting from the wrong (default) tables. */
+        if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0)
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("igraph SET: NULL is not yet supported for table-prefixed graphs")));
 
-        if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0) {
-            /* Use extended API function that supports table prefixes */
-            Oid   argtypes[] = { INT8OID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
-            Datum args[]     = {
-                Int64GetDatum(sp->node_id),
-                CStringGetTextDatum(sp->prop_name),
-                CStringGetTextDatum(type_name),
-                CStringGetTextDatum(val_str),
-                CStringGetTextDatum(ctx->table_prefix)
-            };
-            ret = SPI_execute_with_args(
-                "SELECT graph_set_property($1,$2,$3,$4,$5)",
-                5, argtypes, args, NULL, false, 0);
-        } else {
-            /* Use standard function for default tables (v1.0 compatibility) */
-            Oid   argtypes[] = { INT8OID, TEXTOID, TEXTOID, TEXTOID };
-            Datum args[]     = {
-                Int64GetDatum(sp->node_id),
-                CStringGetTextDatum(sp->prop_name),
-                CStringGetTextDatum(type_name),
-                CStringGetTextDatum(val_str)
-            };
-            ret = SPI_execute_with_args(
-                "SELECT graph_set_property($1,$2,$3,$4)",
-                4, argtypes, args, NULL, false, 0);
-        }
+        Oid   argtypes[] = { INT8OID, TEXTOID };
+        Datum args[]     = {
+            Int64GetDatum(sp->node_id),
+            CStringGetTextDatum(sp->prop_name)
+        };
+        ret = SPI_execute_with_args(
+            "SELECT graph_delete_property($1,$2)",
+            2, argtypes, args, NULL, false, 0);
+
+        if (ret != SPI_OK_SELECT)
+            ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("igraph SET: graph_delete_property failed")));
+
+        SPI_finish();
+        return wrap_ok_simple();
     }
-    else if (resolved_val.type == IGRAPH_VAL_STRING)
+
+    /*
+     * Encode the resolved literal into a pg_ilib BYTEA via pg_ilib's own
+     * encoder functions — never hand-roll the op_id header byte (that's
+     * how the old BOOL path drifted, see pattern node 841). INT and FLOAT
+     * both go through numeric_to_bytea() rather than bigint_to_bytea(),
+     * which has a malformed header and can't be decoded even by pg_ilib's
+     * own bytea_to_bigint() (filed as pg_ilib task #2).
+     */
+    switch (resolved_val.type)
     {
-        if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0) {
-            /* Use extended API function that supports table prefixes */
-            Oid   argtypes[] = { INT8OID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
-            Datum args[]     = {
-                Int64GetDatum(sp->node_id),
-                CStringGetTextDatum(sp->prop_name),
-                CStringGetTextDatum(type_name),
-                CStringGetTextDatum(resolved_val.sval),
-                CStringGetTextDatum(ctx->table_prefix)
-            };
+        case IGRAPH_VAL_STRING:
+        {
+            Oid   argtypes[] = { TEXTOID };
+            Datum args[]     = { CStringGetTextDatum(resolved_val.sval) };
+
+            primitive = 2; /* text */
             ret = SPI_execute_with_args(
-                "SELECT graph_set_property($1,$2,$3,$4,$5)",
-                5, argtypes, args, NULL, false, 0);
-        } else {
-            /* Use standard function for default tables (v1.0 compatibility) */
-            Oid   argtypes[] = { INT8OID, TEXTOID, TEXTOID, TEXTOID };
-            Datum args[]     = {
-                Int64GetDatum(sp->node_id),
-                CStringGetTextDatum(sp->prop_name),
-                CStringGetTextDatum(type_name),
-                CStringGetTextDatum(resolved_val.sval)
-            };
-            ret = SPI_execute_with_args(
-                "SELECT graph_set_property($1,$2,$3,$4)",
-                4, argtypes, args, NULL, false, 0);
+                "SELECT str_to_bytea($1)", 1, argtypes, args, NULL, true, 1);
+            if (ret != SPI_OK_SELECT || SPI_processed == 0)
+                ereport(ERROR, (errmsg("igraph SET: str_to_bytea failed")));
+            value_bytea = DatumGetByteaPCopy(
+                SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+            break;
         }
+        case IGRAPH_VAL_INT:
+        {
+            Oid   argtypes[] = { INT8OID, INT4OID };
+            Datum args[]     = { Int64GetDatum(resolved_val.ival), Int32GetDatum(0) };
+
+            primitive = 1; /* bigint */
+            ret = SPI_execute_with_args(
+                "SELECT numeric_to_bytea($1::numeric,$2)",
+                2, argtypes, args, NULL, true, 1);
+            if (ret != SPI_OK_SELECT || SPI_processed == 0)
+                ereport(ERROR, (errmsg("igraph SET: numeric_to_bytea failed")));
+            value_bytea = DatumGetByteaPCopy(
+                SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+            break;
+        }
+        case IGRAPH_VAL_FLOAT:
+        {
+            Oid   argtypes[] = { FLOAT8OID };
+            Datum args[]     = { Float8GetDatum(resolved_val.fval) };
+
+            primitive = 6; /* numeric */
+            /*
+             * params (the header's declared scale) must match the actual
+             * number of decimal digits GMP-encodes, or bytea_to_numeric()
+             * misplaces the decimal point on decode (e.g. a hardcoded
+             * scale=2 turned 3.5 into 0.35 — the payload only carried one
+             * digit). scale($1::numeric) derives the real digit count
+             * instead of guessing a fixed value.
+             */
+            ret = SPI_execute_with_args(
+                "SELECT numeric_to_bytea($1::numeric, scale($1::numeric))",
+                1, argtypes, args, NULL, true, 1);
+            if (ret != SPI_OK_SELECT || SPI_processed == 0)
+                ereport(ERROR, (errmsg("igraph SET: numeric_to_bytea failed")));
+            value_bytea = DatumGetByteaPCopy(
+                SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+            break;
+        }
+        case IGRAPH_VAL_BOOL:
+        {
+            Oid   argtypes[] = { BOOLOID };
+            Datum args[]     = { BoolGetDatum(resolved_val.bval) };
+
+            primitive = 5; /* bool */
+            ret = SPI_execute_with_args(
+                "SELECT bool_to_bytea($1)", 1, argtypes, args, NULL, true, 1);
+            if (ret != SPI_OK_SELECT || SPI_processed == 0)
+                ereport(ERROR, (errmsg("igraph SET: bool_to_bytea failed")));
+            value_bytea = DatumGetByteaPCopy(
+                SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+            break;
+        }
+        default:
+            ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("igraph SET: unsupported value type")));
+    }
+
+    if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0)
+    {
+        Oid   argtypes[] = { INT8OID, TEXTOID, INT2OID, BYTEAOID, TEXTOID };
+        Datum args[]     = {
+            Int64GetDatum(sp->node_id),
+            CStringGetTextDatum(sp->prop_name),
+            Int16GetDatum(primitive),
+            PointerGetDatum(value_bytea),
+            CStringGetTextDatum(ctx->table_prefix)
+        };
+        ret = SPI_execute_with_args(
+            "SELECT graph_set_property($1,$2,$3,$4,NULL,$5)",
+            5, argtypes, args, NULL, false, 0);
     }
     else
     {
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-             errmsg("igraph SET: unsupported value type")));
+        Oid   argtypes[] = { INT8OID, TEXTOID, INT2OID, BYTEAOID };
+        Datum args[]     = {
+            Int64GetDatum(sp->node_id),
+            CStringGetTextDatum(sp->prop_name),
+            Int16GetDatum(primitive),
+            PointerGetDatum(value_bytea)
+        };
+        ret = SPI_execute_with_args(
+            "SELECT graph_set_property($1,$2,$3,$4,NULL)",
+            4, argtypes, args, NULL, false, 0);
     }
 
     if (ret != SPI_OK_SELECT)
