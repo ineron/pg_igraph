@@ -13,6 +13,7 @@
 #include "catalog/pg_type.h"
 #include "utils/numeric.h"
 #include "utils/array.h"
+#include "utils/json.h"
 
 #include "igraph_query.h"
 
@@ -673,14 +674,106 @@ evaluate_condition(IgraphCond *cond, int64 node_id, const char *node_alias, Igra
 static char *
 build_table_name(const char *base_name, IgraphExecContext *ctx)
 {
-    if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0)
+    const char *table_prefix;
+    char       *dot_pos;
+
+    if (!ctx || !ctx->table_prefix || strlen(ctx->table_prefix) == 0)
+        return pstrdup(base_name);
+
+    table_prefix = ctx->table_prefix;
+
+    /*
+     * Match pg_igraph.c's build_table_name() exactly: the prefix is
+     * concatenated directly with no inserted separator (callers are
+     * expected to include their own trailing "_", e.g. "myproject_"),
+     * and a "schema.prefix_" form splits into a schema-qualified,
+     * double-quoted identifier. The previous "%s_%s" here unconditionally
+     * inserted an extra underscore — harmless for a bare prefix with no
+     * trailing "_", but produced a double underscore (and thus a
+     * nonexistent table name) for the "prefix_" convention actually used
+     * elsewhere in this codebase, and never handled the schema-qualified
+     * form at all.
+     */
+    dot_pos = strchr(table_prefix, '.');
+    if (dot_pos == NULL)
     {
-        StringInfoData buf;
-        initStringInfo(&buf);
-        appendStringInfo(&buf, "%s_%s", ctx->table_prefix, base_name);
-        return buf.data;
+        return psprintf("%s%s", table_prefix, base_name);
     }
-    return pstrdup(base_name);
+    else
+    {
+        int   schema_len = dot_pos - table_prefix;
+        char *schema_name = palloc(schema_len + 1);
+        char *table_prefix_part = dot_pos + 1;
+        char *result;
+
+        strncpy(schema_name, table_prefix, schema_len);
+        schema_name[schema_len] = '\0';
+
+        result = psprintf("\"%s\".\"%s%s\"", schema_name, table_prefix_part, base_name);
+        pfree(schema_name);
+        return result;
+    }
+}
+
+/* ================================================================
+ * Helper: resolve a RETURN field's alias to a concrete node id for
+ * the row currently being emitted by exec_match_ctx.
+ *
+ * When a start id was resolved from WHERE src.id = <int>, rows come
+ * from graph_traverse() and `current_id` is the *other* side of the
+ * edge — so the src alias maps to the constant `start_id` and the dst
+ * alias maps to `current_id`. When no start id could be resolved, rows
+ * instead enumerate src-label candidates directly (no traversal is
+ * performed), so `current_id` IS the src id and there is no dst id to
+ * report — callers get false back for a dst alias in that case.
+ * ================================================================ */
+static bool
+resolve_match_alias_id(IgraphStmtMatch *m, const char *alias,
+                        int64 start_id, int64 current_id, int64 *out_id)
+{
+    bool have_anchor = (start_id >= 0);
+
+    if (m->src && m->src->alias && strcmp(alias, m->src->alias) == 0)
+    {
+        *out_id = have_anchor ? start_id : current_id;
+        return true;
+    }
+    if (m->dst && m->dst->alias && strcmp(alias, m->dst->alias) == 0)
+    {
+        if (!have_anchor)
+            return false;
+        *out_id = current_id;
+        return true;
+    }
+    return false;
+}
+
+/* ================================================================
+ * Helper: append an IgraphValue as a JSON scalar to a StringInfo
+ * ================================================================ */
+static void
+append_igraph_value_json(StringInfoData *buf, IgraphValue v)
+{
+    switch (v.type)
+    {
+        case IGRAPH_VAL_INT:
+            appendStringInfo(buf, INT64_FORMAT, v.ival);
+            break;
+        case IGRAPH_VAL_FLOAT:
+            appendStringInfo(buf, "%.17g", v.fval);
+            break;
+        case IGRAPH_VAL_BOOL:
+            appendStringInfoString(buf, v.bval ? "true" : "false");
+            break;
+        case IGRAPH_VAL_STRING:
+            escape_json(buf, v.sval ? v.sval : "");
+            break;
+        case IGRAPH_VAL_NULL:
+        case IGRAPH_VAL_PARAM:
+        default:
+            appendStringInfoString(buf, "null");
+            break;
+    }
 }
 
 /* ================================================================
@@ -782,7 +875,7 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
 
             appendStringInfo(&traverse_query,
                 "WITH RECURSIVE traverse_cte AS ("
-                "  SELECT %ld as id, 0 as depth "
+                "  SELECT %ld::bigint as id, 0 as depth "
                 "  UNION ALL "
                 "  SELECT CASE WHEN %s THEN e.to_id ELSE e.from_id END as id, "
                 "         tc.depth + 1 "
@@ -837,12 +930,29 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
     nrows    = SPI_processed;
     node_ids = (int64 *) palloc(nrows * sizeof(int64));
 
-    for (i = 0; i < nrows; i++)
     {
-        bool isnull;
-        node_ids[i] = DatumGetInt64(
-            SPI_getbinval(SPI_tuptable->vals[i],
-                          SPI_tuptable->tupdesc, 1, &isnull));
+        uint64 kept = 0;
+
+        for (i = 0; i < nrows; i++)
+        {
+            bool  isnull;
+            int64 candidate = DatumGetInt64(
+                SPI_getbinval(SPI_tuptable->vals[i],
+                              SPI_tuptable->tupdesc, 1, &isnull));
+
+            /*
+             * graph_traverse() includes the start node itself as the
+             * depth-0 entry of its result set (that's correct for its
+             * own contract). For MATCH (n)-[:R]->(m), m is the far side
+             * of the edge, not n — so drop the anchor's own id here or
+             * every row would resolve m to the same node as n.
+             */
+            if (start_id >= 0 && candidate == start_id)
+                continue;
+
+            node_ids[kept++] = candidate;
+        }
+        nrows = kept;
     }
 
     /*
@@ -858,33 +968,38 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
     {
         int64       nid;
         char       *label;
-        Jsonb      *props;
         bool        isnull;
         int         lret;
-        int         pret;
         StringInfoData query;
         bool        node_passes_filter = true;
         IgraphCond *cond;
 
         nid   = node_ids[i];
         label = NULL;
-        props = NULL;
 
-        /* Evaluate all WHERE conditions for this node */
+        /*
+         * Evaluate all WHERE conditions for this node, resolving each
+         * condition's own alias (src or dst) to the id it actually means
+         * for this row — src.id is the fixed anchor/start_id, dst is the
+         * traversed nid. Passing the wrong node's properties into a
+         * condition on the other alias is exactly what caused RETURN'd
+         * rows to reflect the anchor node instead of the real match.
+         */
         cond = m->where;
         while (cond && node_passes_filter)
         {
-            /* For source nodes */
-            if (m->src && m->src->alias) {
-                if (!evaluate_condition(cond, nid, m->src->alias, ctx)) {
+            int64 cond_id;
+
+            if (resolve_match_alias_id(m, cond->alias, start_id, nid, &cond_id))
+            {
+                if (!evaluate_condition(cond, cond_id, cond->alias, ctx)) {
                     node_passes_filter = false;
                     break;
                 }
             }
-
-            /* For target nodes - we need to get target node IDs first */
-            /* This is more complex and would need traversal logic */
-            /* For now, let's focus on source node filtering */
+            /* else: this row can't resolve the condition's alias (e.g. a
+             * dst-alias condition with no traversal target available) —
+             * leave it unenforced rather than reject every row. */
 
             cond = cond->next;
         }
@@ -918,47 +1033,63 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
             strcmp(label, m->dst->label) != 0)
             continue;
 
-        {
-            Oid   pa[]    = { INT8OID };
-            Datum pargs[] = { Int64GetDatum(nid) };
-            pret = SPI_execute_with_args(
-                "SELECT graph_get_node_properties($1, '')",
-                1, pa, pargs, NULL, true, 1);
-            if (pret == SPI_OK_SELECT && SPI_processed > 0)
-            {
-                Datum d = SPI_getbinval(SPI_tuptable->vals[0],
-                                        SPI_tuptable->tupdesc, 1, &isnull);
-                if (!isnull)
-                    props = DatumGetJsonbP(d);
-            }
-        }
-
         /* Add comma separator if not first item */
         if (!first_result) {
             appendStringInfoChar(&json_buf, ',');
         }
         first_result = false;
 
-        /* Build JSON object with StringInfo */
-        appendStringInfo(&json_buf, "{\"id\":%ld", nid);
-        if (label) {
-            appendStringInfo(&json_buf, ",\"label\":\"%s\"", label);
-        }
-
-        /* TODO: Add full returns and properties support with StringInfo later */
-        /*
         if (m->returns)
         {
-            // Complex return field processing - disabled for now
-        }
-        else if (props)
-        {
-            // Complex properties processing - disabled for now
-        }
-        */
+            /* RETURN projection: emit exactly the requested alias[.prop] fields */
+            IgraphReturnField *rf;
+            bool               first_field = true;
 
-        /* Close JSON object */
-        appendStringInfoChar(&json_buf, '}');
+            appendStringInfoChar(&json_buf, '{');
+            for (rf = m->returns; rf; rf = rf->next)
+            {
+                int64 alias_id;
+                bool  resolved = resolve_match_alias_id(m, rf->alias, start_id, nid, &alias_id);
+
+                if (!first_field)
+                    appendStringInfoChar(&json_buf, ',');
+                first_field = false;
+
+                appendStringInfoChar(&json_buf, '"');
+                appendStringInfoString(&json_buf, rf->alias);
+                if (rf->prop)
+                {
+                    appendStringInfoChar(&json_buf, '.');
+                    appendStringInfoString(&json_buf, rf->prop);
+                }
+                appendStringInfoString(&json_buf, "\":");
+
+                if (!resolved)
+                {
+                    appendStringInfoString(&json_buf, "null");
+                }
+                else if (!rf->prop || strcmp(rf->prop, "id") == 0)
+                {
+                    appendStringInfo(&json_buf, INT64_FORMAT, alias_id);
+                }
+                else
+                {
+                    IgraphValue v = get_node_property_value(alias_id, rf->prop, ctx);
+                    append_igraph_value_json(&json_buf, v);
+                }
+            }
+            appendStringInfoChar(&json_buf, '}');
+        }
+        else
+        {
+            /* No RETURN clause: default shape — matched node's id + label */
+            appendStringInfo(&json_buf, "{\"id\":%ld", nid);
+            if (label) {
+                appendStringInfoString(&json_buf, ",\"label\":");
+                escape_json(&json_buf, label);
+            }
+            appendStringInfoChar(&json_buf, '}');
+        }
     }
 
     appendStringInfo(&json_buf, "]");  /* Close array only */
