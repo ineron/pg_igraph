@@ -29,14 +29,22 @@ SELECT igraph_query('shop_', format('PATH FROM %s TO %s VIA refers', :pc1, :pc2)
 (1 row)
 
 -- ============================================================
--- KNOWN BUG (task #17): MATCH with no WHERE anchor doesn't traverse from
--- each label-matching node at all -- exec_match_ctx's start_id<0 branch
--- (igraph_exec.c ~916-931) does a label scan and treats every matching
--- node as *both* n and m directly (no actual edge walk), and dst-alias
--- WHERE/RETURN fields silently resolve to null/unenforced (resolve_
--- match_alias_id, igraph_exec.c ~751-752). Both rows below show n and m
--- as the *same* node (U1/U1, U2/U2) instead of the real U1->U2 edge, and
--- m.name is null even though a WHERE m.name filter is present.
+-- FIXED (task #17, 2026-08-04): MATCH with no WHERE anchor used to skip
+-- the edge walk entirely -- exec_match_ctx's start_id<0 branch did a
+-- label scan and returned every matching node directly as if it were
+-- both n and m, with dst-alias WHERE/RETURN fields silently resolving to
+-- null/unenforced. Now every label-matching `n` candidate is actually
+-- traversed: default (non-prefixed) tables batch through a new pure-C
+-- adjacency-list BFS (igraph_match_traverse_multi_internal, pg_igraph.c)
+-- that loads the edge table once and walks every candidate in memory;
+-- prefixed tables batch the same candidates into a single recursive CTE
+-- seeded from all of them at once. resolve_match_alias_id (igraph_exec.c)
+-- was simplified to resolve each row's own (src_id, dst_id) pair instead
+-- of one global anchor. Both rows below now correctly show the real
+-- U1->U2 edge (n=U1, m=U2) instead of the old n==m self-pairs with a
+-- null m.name. Kept here rather than moved into REGRESSION ANCHORS, to
+-- avoid shifting every node id generated later in this file (same reason
+-- the NumBug fixture below stayed put after task #21).
 -- ============================================================
 SELECT graph_add_node('Unanchored') AS u1 \gset
 SELECT graph_add_node('Unanchored') AS u2 \gset
@@ -59,15 +67,15 @@ SELECT graph_set_property(:u2, 'name', 2::smallint, str_to_bytea('U2'));
 (1 row)
 
 SELECT igraph_query('MATCH (n:Unanchored)-[:link]->(m:Unanchored) RETURN n.name, m.name');
-                             igraph_query                             
-----------------------------------------------------------------------
- [{"m.name": null, "n.name": "U1"}, {"m.name": null, "n.name": "U2"}]
+            igraph_query            
+------------------------------------
+ [{"m.name": "U2", "n.name": "U1"}]
 (1 row)
 
 SELECT igraph_query('MATCH (n:Unanchored)-[:link]->(m:Unanchored) WHERE m.name = ''U2'' RETURN n.name, m.name');
-                             igraph_query                             
-----------------------------------------------------------------------
- [{"m.name": null, "n.name": "U1"}, {"m.name": null, "n.name": "U2"}]
+            igraph_query            
+------------------------------------
+ [{"m.name": "U2", "n.name": "U1"}]
 (1 row)
 
 -- ============================================================
@@ -381,5 +389,55 @@ SELECT graph_get_node_properties(:sf1) - 'age' - 'ratio' - 'active' AS greeting_
  greeting_deleted 
 ------------------
  {}
+(1 row)
+
+-- task #17 (continued): unanchored MATCH with more than one label-matching
+-- `n` candidate, each with its own distinct outgoing edge -- proves the
+-- batched traversal (igraph_match_traverse_multi_internal) walks every
+-- candidate, not just the first/only one.
+SELECT graph_add_node('UnanchoredMulti') AS um1 \gset
+SELECT graph_add_node('UnanchoredMulti') AS um2 \gset
+SELECT graph_add_node('UnanchoredMulti') AS um3 \gset
+SELECT graph_add_node('UnanchoredMulti') AS um4 \gset
+SELECT graph_add_edge(:um1, :um2, 'mlink');
+ graph_add_edge 
+----------------
+ 
+(1 row)
+
+SELECT graph_add_edge(:um3, :um4, 'mlink');
+ graph_add_edge 
+----------------
+ 
+(1 row)
+
+SELECT graph_set_property(:um1, 'name', 2::smallint, str_to_bytea('M1'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:um2, 'name', 2::smallint, str_to_bytea('M2'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:um3, 'name', 2::smallint, str_to_bytea('M3'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT graph_set_property(:um4, 'name', 2::smallint, str_to_bytea('M4'));
+ graph_set_property 
+--------------------
+ 
+(1 row)
+
+SELECT igraph_query('MATCH (n:UnanchoredMulti)-[:mlink]->(m:UnanchoredMulti) RETURN n.name, m.name');
+                             igraph_query                             
+----------------------------------------------------------------------
+ [{"m.name": "M2", "n.name": "M1"}, {"m.name": "M4", "n.name": "M3"}]
 (1 row)
 

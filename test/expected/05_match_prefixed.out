@@ -42,6 +42,19 @@ SELECT igraph_query('shop_',
  [{"id": 2, "label": "Customer"}]
 (1 row)
 
+-- Unanchored MATCH (no WHERE n.id = <int>) over a prefixed graph -- task
+-- #17's fix batches every label-matching candidate into a single
+-- recursive CTE seed (igraph_exec.c's exec_match_ctx) instead of the
+-- pure-C engine used for default tables, since build_adj_list only knows
+-- the default edges/rel_types tables. Same c1->c2 edge as above.
+SELECT igraph_query('shop_',
+  'MATCH (n:Customer)-[:refers]->(m:Customer) RETURN n.name, m.name',
+  NULL::jsonb);
+                  igraph_query                  
+------------------------------------------------
+ [{"m.name": "ShopBob", "n.name": "ShopAlice"}]
+(1 row)
+
 -- CREATE via query language, scoped to the prefixed graph
 SELECT igraph_query('shop_', 'CREATE (n:Customer)', NULL::jsonb);
           igraph_query          
@@ -93,6 +106,16 @@ SELECT igraph_query('social.social_',
           igraph_query          
 --------------------------------
  [{"id": 2, "label": "Member"}]
+(1 row)
+
+-- Unanchored MATCH over a schema-qualified prefix -- same batched-CTE
+-- path as the shop_ case above, exercised against a dotted table_prefix.
+SELECT igraph_query('social.social_',
+  'MATCH (n:Member)-[:friends]->(m:Member) RETURN n.name, m.name',
+  NULL::jsonb);
+                 igraph_query                 
+----------------------------------------------
+ [{"m.name": "SocBob", "n.name": "SocAlice"}]
 (1 row)
 
 -- ============================================================

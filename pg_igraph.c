@@ -1532,6 +1532,159 @@ igraph_shortest_path_internal(int64  start_id,
     MemoryContextDelete(work_ctx);
     return result;
 }
+
+/* ================================================================
+ * igraph_match_traverse_multi_internal
+ *
+ * Pure-C batched BFS from multiple seed nodes over the in-memory
+ * adjacency list, for the default (non-prefixed) edges table. This is
+ * what unanchored MATCH (n:Label)-[:REL]->(m) needs: one traversal per
+ * label-matching `n` candidate, without paying an SPI round trip per
+ * candidate. The adjacency list is loaded ONCE (single bulk edge scan)
+ * and reused across every seed.
+ *
+ * Precondition: SPI must be open (caller owns SPI connection) — same
+ * contract as igraph_shortest_path_internal above.
+ * Result arrays (*out_src / *out_dst) are palloc'd in CurrentMemoryContext
+ * (caller_ctx), one entry per (seed, reached-node) pair, depths 1..max_depth.
+ * A seed's own id is never emitted (matches graph_traverse's convention of
+ * excluding the start node from "reached" results); *out_len is set to 0
+ * and both arrays left NULL if nothing was reached.
+ * ================================================================ */
+void
+igraph_match_traverse_multi_internal(int64 *seed_ids, int n_seeds,
+                                      const char *rel_type, bool direction,
+                                      int max_depth,
+                                      int64 **out_src, int64 **out_dst,
+                                      int *out_len)
+{
+    MemoryContext caller_ctx = CurrentMemoryContext;
+
+    *out_src = NULL;
+    *out_dst = NULL;
+    *out_len = 0;
+
+    if (n_seeds <= 0 || max_depth <= 0)
+        return;
+
+    MemoryContext work_ctx = AllocSetContextCreate(caller_ctx,
+                                                    "igraph_match_multi_work",
+                                                    ALLOCSET_DEFAULT_SIZES);
+
+    SPI_connect();
+    prepare_plans();
+
+    int16 rel_id;
+    {
+        bool  isnull;
+        Datum rel_args[] = { CStringGetTextDatum(rel_type) };
+        int   rret = SPI_execute_plan(plan_get_rel_id, rel_args, NULL, true, 1);
+        MemoryContextSwitchTo(work_ctx);
+        if (rret != SPI_OK_SELECT || SPI_processed == 0)
+            elog(ERROR, "igraph_match_traverse_multi_internal: unknown rel_type '%s'", rel_type);
+        rel_id = DatumGetInt16(
+            SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+    }
+
+    AdjList *adj = build_adj_list(rel_id, direction, work_ctx);
+    MemoryContextSwitchTo(work_ctx);
+    SPI_finish();
+    MemoryContextSwitchTo(work_ctx);
+
+    /* Output pair accumulator — lives directly in work_ctx, copied to
+     * caller_ctx at the very end (mirrors igraph_shortest_path_internal's
+     * result-copy pattern). */
+    int    out_cap  = 256;
+    int64 *pair_src = (int64 *) palloc(out_cap * sizeof(int64));
+    int64 *pair_dst = (int64 *) palloc(out_cap * sizeof(int64));
+    int    out_size = 0;
+
+    /* Reset per seed so one seed's visited-set never suppresses a node
+     * that a different seed also needs to reach. */
+    MemoryContext seed_ctx = AllocSetContextCreate(work_ctx,
+                                                    "igraph_match_multi_seed",
+                                                    ALLOCSET_SMALL_SIZES);
+
+    for (int s = 0; s < n_seeds; s++)
+    {
+        int64 seed = seed_ids[s];
+
+        MemoryContextSwitchTo(seed_ctx);
+
+        HASHCTL hctl;
+        memset(&hctl, 0, sizeof(hctl));
+        hctl.keysize   = sizeof(int64);
+        hctl.entrysize = sizeof(int64);
+        hctl.hcxt      = seed_ctx;
+        HTAB *visited = hash_create("igraph_match_multi_visited", 64,
+                                    &hctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+        { bool found; hash_search(visited, &seed, HASH_ENTER, &found); }
+
+        int    cur_cap   = 64, cur_size = 1;
+        int64 *cur_level = (int64 *) palloc(cur_cap * sizeof(int64));
+        cur_level[0] = seed;
+
+        int depth = 0;
+        while (depth < max_depth && cur_size > 0)
+        {
+            int    next_cap   = cur_cap;
+            int    next_size  = 0;
+            int64 *next_level = (int64 *) palloc(next_cap * sizeof(int64));
+
+            for (int i = 0; i < cur_size; i++)
+            {
+                int    n_nbrs;
+                int64 *nbrs = adj_get(adj, cur_level[i], &n_nbrs);
+
+                for (int j = 0; j < n_nbrs; j++)
+                {
+                    int64 nbr = nbrs[j];
+                    bool  found;
+
+                    hash_search(visited, &nbr, HASH_ENTER, &found);
+                    if (found) continue;
+
+                    if (next_size >= next_cap)
+                    {
+                        next_cap  *= 2;
+                        next_level = (int64 *) repalloc(next_level, next_cap * sizeof(int64));
+                    }
+                    next_level[next_size++] = nbr;
+
+                    if (out_size >= out_cap)
+                    {
+                        out_cap  *= 2;
+                        pair_src = (int64 *) repalloc(pair_src, out_cap * sizeof(int64));
+                        pair_dst = (int64 *) repalloc(pair_dst, out_cap * sizeof(int64));
+                    }
+                    pair_src[out_size] = seed;
+                    pair_dst[out_size] = nbr;
+                    out_size++;
+                }
+            }
+
+            cur_level = next_level;
+            cur_cap   = next_cap;
+            cur_size  = next_size;
+            depth++;
+        }
+
+        MemoryContextReset(seed_ctx);
+    }
+
+    MemoryContextSwitchTo(caller_ctx);
+    if (out_size > 0)
+    {
+        *out_src = (int64 *) palloc(out_size * sizeof(int64));
+        *out_dst = (int64 *) palloc(out_size * sizeof(int64));
+        memcpy(*out_src, pair_src, out_size * sizeof(int64));
+        memcpy(*out_dst, pair_dst, out_size * sizeof(int64));
+    }
+    *out_len = out_size;
+
+    MemoryContextDelete(work_ctx);
+}
+
 PG_FUNCTION_INFO_V1(graph_shortest_path);
 Datum graph_shortest_path(PG_FUNCTION_ARGS)
 {

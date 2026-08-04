@@ -687,30 +687,24 @@ build_table_name(const char *base_name, IgraphExecContext *ctx)
  * Helper: resolve a RETURN field's alias to a concrete node id for
  * the row currently being emitted by exec_match_ctx.
  *
- * When a start id was resolved from WHERE src.id = <int>, rows come
- * from graph_traverse() and `current_id` is the *other* side of the
- * edge — so the src alias maps to the constant `start_id` and the dst
- * alias maps to `current_id`. When no start id could be resolved, rows
- * instead enumerate src-label candidates directly (no traversal is
- * performed), so `current_id` IS the src id and there is no dst id to
- * report — callers get false back for a dst alias in that case.
+ * Every result row now carries its own resolved (row_src_id, row_dst_id)
+ * pair — the anchored case (WHERE src.id = <int>) fills row_src_id with
+ * the constant start_id for every row, the unanchored case fills it with
+ * each traversal's own seed candidate — so this is just a direct
+ * alias→id lookup, no "is there an anchor" branching needed.
  * ================================================================ */
 static bool
 resolve_match_alias_id(IgraphStmtMatch *m, const char *alias,
-                        int64 start_id, int64 current_id, int64 *out_id)
+                        int64 row_src_id, int64 row_dst_id, int64 *out_id)
 {
-    bool have_anchor = (start_id >= 0);
-
     if (m->src && m->src->alias && strcmp(alias, m->src->alias) == 0)
     {
-        *out_id = have_anchor ? start_id : current_id;
+        *out_id = row_src_id;
         return true;
     }
     if (m->dst && m->dst->alias && strcmp(alias, m->dst->alias) == 0)
     {
-        if (!have_anchor)
-            return false;
-        *out_id = current_id;
+        *out_id = row_dst_id;
         return true;
     }
     return false;
@@ -793,7 +787,8 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
     IgraphCond      *c;
     int              ret;
     uint64           nrows;
-    int64           *node_ids;
+    int64           *pair_src;
+    int64           *pair_dst;
     uint64           i;
     char            *nodes_table, *node_labels_table;
 
@@ -839,8 +834,6 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
             StringInfoData traverse_query;
             initStringInfo(&traverse_query);
 
-            /* For now, we'll do a simple traversal query using prefixed edge tables */
-            /* This is a simplified version - full BFS traversal would need more complex logic */
             char *edges_table = build_table_name("edges", ctx);
             char *rel_types_table = build_table_name("rel_types", ctx);
 
@@ -852,12 +845,14 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
                 "         tc.depth + 1 "
                 "  FROM traverse_cte tc "
                 "  JOIN %s e ON (CASE WHEN %s THEN e.from_id ELSE e.to_id END) = tc.id "
+                "         AND e.direction = %s "
                 "  JOIN %s rt ON rt.id = e.rel_type "
                 "  WHERE tc.depth < %d AND rt.name = '%s' "
                 ") "
                 "SELECT DISTINCT id FROM traverse_cte WHERE depth > 0",
                 start_id, direction ? "true" : "false", edges_table,
-                direction ? "true" : "false", rel_types_table, max_depth, rel_type);
+                direction ? "true" : "false", direction ? "true" : "false",
+                rel_types_table, max_depth, rel_type);
 
             ret = SPI_execute(traverse_query.data, true, 0);
             pfree(traverse_query.data);
@@ -876,9 +871,66 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
                 "SELECT * FROM graph_traverse($1,$2,$3,$4)",
                 4, argtypes, args, NULL, true, 0);
         }
+
+        if (ret != SPI_OK_SELECT)
+            ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("igraph MATCH: graph_traverse failed (ret=%d)", ret)));
+
+        /*
+         * SPI_execute()/SPI_execute_with_args() leave CurrentMemoryContext
+         * pointing at SPI's own per-call context, not the caller's — every
+         * other SPI call site in this codebase (pg_igraph.c) explicitly
+         * switches back afterward for the same reason. Skipping this here
+         * left the eventual jsonb_in() result built in a context that
+         * SPI_finish() frees before it's returned — a real, reproduced
+         * SIGSEGV at scale (task #17 testing, 2026-08-04).
+         */
+        MemoryContextSwitchTo(caller_ctx);
+
+        nrows    = SPI_processed;
+        pair_src = (int64 *) palloc((nrows > 0 ? nrows : 1) * sizeof(int64));
+        pair_dst = (int64 *) palloc((nrows > 0 ? nrows : 1) * sizeof(int64));
+
+        {
+            uint64 kept = 0;
+
+            for (i = 0; i < nrows; i++)
+            {
+                bool  isnull;
+                int64 candidate = DatumGetInt64(
+                    SPI_getbinval(SPI_tuptable->vals[i],
+                                  SPI_tuptable->tupdesc, 1, &isnull));
+
+                /*
+                 * graph_traverse() includes the start node itself as the
+                 * depth-0 entry of its result set (that's correct for its
+                 * own contract). For MATCH (n)-[:R]->(m), m is the far side
+                 * of the edge, not n — so drop the anchor's own id here or
+                 * every row would resolve m to the same node as n.
+                 */
+                if (candidate == start_id)
+                    continue;
+
+                pair_src[kept] = start_id;
+                pair_dst[kept] = candidate;
+                kept++;
+            }
+            nrows = kept;
+        }
     } else {
-        /* No specific start ID - get all nodes with the source label */
+        /*
+         * No explicit n.id = <int> anchor: every label-matching node is a
+         * candidate `n`, and the relationship must actually be walked from
+         * each of them — this branch used to return the label-matching
+         * nodes directly as if they were `m`, with no edge walk at all
+         * (task #17). Collect the candidates first, then batch-traverse
+         * from all of them in one shot.
+         */
         StringInfoData query;
+        uint64         n_candidates;
+        int64         *candidate_ids = NULL;
+
         initStringInfo(&query);
         appendStringInfo(&query,
             "SELECT DISTINCT n.id FROM %s n "
@@ -891,39 +943,128 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
 
         ret = SPI_execute(query.data, true, 0);
         pfree(query.data);
-    }
 
-    if (ret != SPI_OK_SELECT)
-        ereport(ERROR,
-            (errcode(ERRCODE_INTERNAL_ERROR),
-             errmsg("igraph MATCH: graph_traverse failed (ret=%d)", ret)));
+        if (ret != SPI_OK_SELECT)
+            ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("igraph MATCH: candidate scan failed (ret=%d)", ret)));
 
-    nrows    = SPI_processed;
-    node_ids = (int64 *) palloc(nrows * sizeof(int64));
+        /* See the matching comment on the anchored branch above — SPI_execute()
+         * does not restore the caller's memory context on its own. */
+        MemoryContextSwitchTo(caller_ctx);
 
-    {
-        uint64 kept = 0;
-
-        for (i = 0; i < nrows; i++)
+        n_candidates = SPI_processed;
+        if (n_candidates > 0)
         {
-            bool  isnull;
-            int64 candidate = DatumGetInt64(
-                SPI_getbinval(SPI_tuptable->vals[i],
-                              SPI_tuptable->tupdesc, 1, &isnull));
-
-            /*
-             * graph_traverse() includes the start node itself as the
-             * depth-0 entry of its result set (that's correct for its
-             * own contract). For MATCH (n)-[:R]->(m), m is the far side
-             * of the edge, not n — so drop the anchor's own id here or
-             * every row would resolve m to the same node as n.
-             */
-            if (start_id >= 0 && candidate == start_id)
-                continue;
-
-            node_ids[kept++] = candidate;
+            candidate_ids = (int64 *) palloc(n_candidates * sizeof(int64));
+            for (i = 0; i < n_candidates; i++)
+            {
+                bool isnull;
+                candidate_ids[i] = DatumGetInt64(
+                    SPI_getbinval(SPI_tuptable->vals[i],
+                                  SPI_tuptable->tupdesc, 1, &isnull));
+            }
         }
-        nrows = kept;
+
+        if (n_candidates == 0)
+        {
+            pair_src = NULL;
+            pair_dst = NULL;
+            nrows    = 0;
+        }
+        else if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0)
+        {
+            /*
+             * Prefixed graphs have no C-level adjacency engine — build_
+             * adj_list only knows the default edges/rel_types tables, and
+             * a cached SPI plan can't target a dynamic table name. Stay on
+             * a recursive CTE here, but seed it from every candidate at
+             * once instead of walking one candidate per query, so this is
+             * still a single SPI round trip no matter how many candidates
+             * matched.
+             */
+            char      *edges_table     = build_table_name("edges", ctx);
+            char      *rel_types_table = build_table_name("rel_types", ctx);
+            Datum     *elems;
+            ArrayType *seed_arr;
+            StringInfoData traverse_query;
+
+            elems = (Datum *) palloc(n_candidates * sizeof(Datum));
+            for (i = 0; i < n_candidates; i++)
+                elems[i] = Int64GetDatum(candidate_ids[i]);
+            seed_arr = construct_array(elems, (int) n_candidates,
+                                       INT8OID, sizeof(int64),
+                                       true, TYPALIGN_DOUBLE);
+            pfree(elems);
+
+            initStringInfo(&traverse_query);
+            appendStringInfo(&traverse_query,
+                "WITH RECURSIVE traverse_cte AS ("
+                "  SELECT c.id AS root_id, c.id AS id, 0 AS depth "
+                "    FROM unnest($1::bigint[]) AS c(id) "
+                "  UNION ALL "
+                "  SELECT tc.root_id, "
+                "         CASE WHEN %s THEN e.to_id ELSE e.from_id END, "
+                "         tc.depth + 1 "
+                "  FROM traverse_cte tc "
+                "  JOIN %s e ON (CASE WHEN %s THEN e.from_id ELSE e.to_id END) = tc.id "
+                "         AND e.direction = %s "
+                "  JOIN %s rt ON rt.id = e.rel_type "
+                "  WHERE tc.depth < %d AND rt.name = '%s' "
+                ") "
+                "SELECT DISTINCT root_id, id FROM traverse_cte WHERE depth > 0",
+                direction ? "true" : "false", edges_table,
+                direction ? "true" : "false", direction ? "true" : "false",
+                rel_types_table, max_depth, rel_type);
+
+            {
+                Oid   argtypes[] = { INT8ARRAYOID };
+                Datum args[]     = { PointerGetDatum(seed_arr) };
+                ret = SPI_execute_with_args(traverse_query.data,
+                                            1, argtypes, args, NULL, true, 0);
+            }
+            pfree(traverse_query.data);
+            pfree(edges_table);
+            pfree(rel_types_table);
+
+            if (ret != SPI_OK_SELECT)
+                ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("igraph MATCH: unanchored prefixed traversal failed (ret=%d)", ret)));
+
+            /* See the matching comment on the anchored branch above. */
+            MemoryContextSwitchTo(caller_ctx);
+
+            nrows    = SPI_processed;
+            pair_src = (int64 *) palloc((nrows > 0 ? nrows : 1) * sizeof(int64));
+            pair_dst = (int64 *) palloc((nrows > 0 ? nrows : 1) * sizeof(int64));
+            for (i = 0; i < nrows; i++)
+            {
+                bool isnull;
+                pair_src[i] = DatumGetInt64(
+                    SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+                pair_dst[i] = DatumGetInt64(
+                    SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+            }
+        }
+        else
+        {
+            /*
+             * Default tables: batched pure-C BFS (igraph_match_traverse_
+             * multi_internal) — one bulk edge-table load, then an
+             * in-memory traversal per candidate, zero further SPI round
+             * trips.
+             */
+            int64 *c_src = NULL, *c_dst = NULL;
+            int    c_len = 0;
+
+            igraph_match_traverse_multi_internal(candidate_ids, (int) n_candidates,
+                                                 rel_type, direction, max_depth,
+                                                 &c_src, &c_dst, &c_len);
+            pair_src = c_src;
+            pair_dst = c_dst;
+            nrows    = (uint64) c_len;
+        }
     }
 
     /*
@@ -937,7 +1078,7 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
     bool first_result = true;
     for (i = 0; i < nrows; i++)
     {
-        int64       nid;
+        int64       dst_id;
         char       *label;
         bool        isnull;
         int         lret;
@@ -945,31 +1086,29 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
         bool        node_passes_filter = true;
         IgraphCond *cond;
 
-        nid   = node_ids[i];
-        label = NULL;
+        dst_id = pair_dst[i];
+        label  = NULL;
 
         /*
-         * Evaluate all WHERE conditions for this node, resolving each
-         * condition's own alias (src or dst) to the id it actually means
-         * for this row — src.id is the fixed anchor/start_id, dst is the
-         * traversed nid. Passing the wrong node's properties into a
-         * condition on the other alias is exactly what caused RETURN'd
-         * rows to reflect the anchor node instead of the real match.
+         * Evaluate all WHERE conditions for this row, resolving each
+         * condition's own alias (src or dst) against this row's own
+         * (pair_src[i], pair_dst[i]) pair — every row now carries its own
+         * independently-resolved src/dst, anchored or not (see
+         * resolve_match_alias_id).
          */
         cond = m->where;
         while (cond && node_passes_filter)
         {
             int64 cond_id;
 
-            if (resolve_match_alias_id(m, cond->alias, start_id, nid, &cond_id))
+            if (resolve_match_alias_id(m, cond->alias, pair_src[i], pair_dst[i], &cond_id))
             {
                 if (!evaluate_condition(cond, cond_id, cond->alias, ctx)) {
                     node_passes_filter = false;
                     break;
                 }
             }
-            /* else: this row can't resolve the condition's alias (e.g. a
-             * dst-alias condition with no traversal target available) —
+            /* else: this row can't resolve the condition's alias —
              * leave it unenforced rather than reject every row. */
 
             cond = cond->next;
@@ -990,10 +1129,17 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
 
         {
             Oid   la[]    = { INT8OID };
-            Datum largs[] = { Int64GetDatum(nid) };
+            Datum largs[] = { Int64GetDatum(dst_id) };
             lret = SPI_execute_with_args(
                 query.data,
                 1, la, largs, NULL, true, 1);
+            /* See the matching comment above exec_match_ctx's traversal
+             * calls — SPI_execute_with_args() leaves CurrentMemoryContext
+             * pointing at SPI's own context, not the caller's. This runs
+             * once per result row, so it's the site most directly
+             * responsible for leaving that wrong context active right
+             * before the final jsonb_in() call below. */
+            MemoryContextSwitchTo(caller_ctx);
             if (lret == SPI_OK_SELECT && SPI_processed > 0)
                 label = TextDatumGetCString(
                     SPI_getbinval(SPI_tuptable->vals[0],
@@ -1020,7 +1166,7 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
             for (rf = m->returns; rf; rf = rf->next)
             {
                 int64 alias_id;
-                bool  resolved = resolve_match_alias_id(m, rf->alias, start_id, nid, &alias_id);
+                bool  resolved = resolve_match_alias_id(m, rf->alias, pair_src[i], pair_dst[i], &alias_id);
 
                 if (!first_field)
                     appendStringInfoChar(&json_buf, ',');
@@ -1054,7 +1200,7 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
         else
         {
             /* No RETURN clause: default shape — matched node's id + label */
-            appendStringInfo(&json_buf, "{\"id\":%ld", nid);
+            appendStringInfo(&json_buf, "{\"id\":%ld", dst_id);
             if (label) {
                 appendStringInfoString(&json_buf, ",\"label\":");
                 escape_json(&json_buf, label);
@@ -1079,7 +1225,8 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
 
     /* Clean up */
     pfree(json_buf.data);
-    pfree(node_ids);
+    if (pair_src) pfree(pair_src);
+    if (pair_dst) pfree(pair_dst);
     pfree(nodes_table);
     pfree(node_labels_table);
     SPI_finish();
@@ -1207,14 +1354,13 @@ exec_match_bare_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
         IgraphCond *cond;
 
         /* Each candidate resolves the src alias to its own id — there
-         * is no anchor/traversal target distinction in a bare match,
-         * so pass start_id=-1 regardless of how the candidate list
-         * above was narrowed. */
+         * is no dst in a bare match (m->dst is always NULL for this
+         * shape), so row_dst_id is irrelevant here. */
         cond = m->where;
         while (cond && node_passes_filter)
         {
             int64 cond_id;
-            if (resolve_match_alias_id(m, cond->alias, -1, nid, &cond_id))
+            if (resolve_match_alias_id(m, cond->alias, nid, nid, &cond_id))
             {
                 if (!evaluate_condition(cond, cond_id, cond->alias, ctx))
                     node_passes_filter = false;
@@ -1254,7 +1400,7 @@ exec_match_bare_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
             for (rf = m->returns; rf; rf = rf->next)
             {
                 int64 alias_id;
-                bool  resolved = resolve_match_alias_id(m, rf->alias, -1, nid, &alias_id);
+                bool  resolved = resolve_match_alias_id(m, rf->alias, nid, nid, &alias_id);
 
                 if (!first_field)
                     appendStringInfoChar(&json_buf, ',');

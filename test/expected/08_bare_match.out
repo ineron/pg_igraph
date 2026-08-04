@@ -35,14 +35,14 @@ SELECT graph_set_property(:cy,  'name', 2::smallint, str_to_bytea('Cy'));
 SELECT igraph_query('MATCH (n:BareA) RETURN n.id, n.name');
                          igraph_query                          
 ---------------------------------------------------------------
- [{"n.id": 39, "n.name": "Ann"}, {"n.id": 40, "n.name": "Bo"}]
+ [{"n.id": 43, "n.name": "Ann"}, {"n.id": 44, "n.name": "Bo"}]
 (1 row)
 
 -- bare alias with no prop -> just the id
 SELECT igraph_query('MATCH (n:BareA) RETURN n');
       igraph_query      
 ------------------------
- [{"n": 39}, {"n": 40}]
+ [{"n": 43}, {"n": 44}]
 (1 row)
 
 -- ============================================================
@@ -67,7 +67,7 @@ SELECT igraph_query(format('MATCH (n:BareB) WHERE n.id = %s RETURN n.name', :ann
 SELECT igraph_query(format('MATCH (n:BareB) WHERE n.id = %s', :cy));
           igraph_query          
 --------------------------------
- [{"id": 41, "label": "BareB"}]
+ [{"id": 45, "label": "BareB"}]
 (1 row)
 
 -- ============================================================
@@ -85,7 +85,7 @@ SELECT igraph_query('MATCH (n:NoSuchBareLabel) RETURN n');
 SELECT igraph_query('MATCH (n:BareA) WHERE n.name = ''Bo'' RETURN n.id, n.name');
           igraph_query          
 --------------------------------
- [{"n.id": 40, "n.name": "Bo"}]
+ [{"n.id": 44, "n.name": "Bo"}]
 (1 row)
 
 -- ============================================================
@@ -96,6 +96,6 @@ SELECT igraph_query('MATCH (n:BareA) WHERE n.name = ''Bo'' RETURN n.id, n.name')
 SELECT igraph_query(format('MATCH (n) WHERE n.id > %s RETURN n.id, n.name', COALESCE(:max_before, 0)));
                                         igraph_query                                         
 ---------------------------------------------------------------------------------------------
- [{"n.id": 39, "n.name": "Ann"}, {"n.id": 40, "n.name": "Bo"}, {"n.id": 41, "n.name": "Cy"}]
+ [{"n.id": 43, "n.name": "Ann"}, {"n.id": 44, "n.name": "Bo"}, {"n.id": 45, "n.name": "Cy"}]
 (1 row)
 
