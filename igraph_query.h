@@ -223,11 +223,12 @@ int64 *igraph_shortest_path_internal(int64  start_id,
  * igraph_match_traverse_multi_internal — batched pure-C BFS from multiple
  * seed nodes (default/non-prefixed edges table only). Caller must open
  * SPI before calling. out_src and out_dst are palloc'd in caller's memory
- * context, one (seed, reached-node) pair per entry, depths 1..max_depth.
+ * context, one (seed, reached-node) pair per entry, depths min_depth..max_depth
+ * (pass min_depth=1 for the traditional "any depth up to max" behavior).
  * *out_len is set to 0 and both arrays left NULL if nothing was reached.
  */
 void igraph_match_traverse_multi_internal(int64 *seed_ids, int n_seeds,
                                           const char *rel_type, bool direction,
-                                          int max_depth,
+                                          int max_depth, int min_depth,
                                           int64 **out_src, int64 **out_dst,
                                           int *out_len);

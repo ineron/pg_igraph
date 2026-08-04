@@ -804,6 +804,7 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
     const char      *rel_type;
     bool             direction;
     int              max_depth;
+    int              min_depth;
     JsonbParseState *s;
     IgraphCond      *c;
     int              ret;
@@ -820,6 +821,7 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
     rel_type  = m->rel->rel_type;
     direction = (m->rel->dir != DIR_LEFT);
     max_depth = m->rel->max_depth;
+    min_depth = m->rel->min_depth;
     s         = NULL;
 
     /* Build table names with prefix */
@@ -870,74 +872,75 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
                 "  JOIN %s rt ON rt.id = e.rel_type "
                 "  WHERE tc.depth < %d AND rt.name = '%s' "
                 ") "
-                "SELECT DISTINCT id FROM traverse_cte WHERE depth > 0",
+                "SELECT DISTINCT id FROM traverse_cte WHERE depth >= %d",
                 start_id, direction ? "true" : "false", edges_table,
                 direction ? "true" : "false", direction ? "true" : "false",
-                rel_types_table, max_depth, rel_type);
+                rel_types_table, max_depth, rel_type, min_depth);
 
             ret = SPI_execute(traverse_query.data, true, 0);
             pfree(traverse_query.data);
             pfree(edges_table);
             pfree(rel_types_table);
-        } else {
-            /* Use standard graph_traverse function for default tables */
-            Oid   argtypes[] = { INT8OID, TEXTOID, BOOLOID, INT4OID };
-            Datum args[]     = {
-                Int64GetDatum(start_id),
-                CStringGetTextDatum(rel_type),
-                BoolGetDatum(direction),
-                Int32GetDatum(max_depth)
-            };
-            ret = SPI_execute_with_args(
-                "SELECT * FROM graph_traverse($1,$2,$3,$4)",
-                4, argtypes, args, NULL, true, 0);
-        }
 
-        if (ret != SPI_OK_SELECT)
-            ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("igraph MATCH: graph_traverse failed (ret=%d)", ret)));
+            if (ret != SPI_OK_SELECT)
+                ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("igraph MATCH: graph_traverse failed (ret=%d)", ret)));
 
-        /*
-         * SPI_execute()/SPI_execute_with_args() leave CurrentMemoryContext
-         * pointing at SPI's own per-call context, not the caller's — every
-         * other SPI call site in this codebase (pg_igraph.c) explicitly
-         * switches back afterward for the same reason. Skipping this here
-         * left the eventual jsonb_in() result built in a context that
-         * SPI_finish() frees before it's returned — a real, reproduced
-         * SIGSEGV at scale (task #17 testing, 2026-08-04).
-         */
-        MemoryContextSwitchTo(caller_ctx);
+            /*
+             * SPI_execute()/SPI_execute_with_args() leave CurrentMemoryContext
+             * pointing at SPI's own per-call context, not the caller's — every
+             * other SPI call site in this codebase (pg_igraph.c) explicitly
+             * switches back afterward for the same reason. Skipping this here
+             * left the eventual jsonb_in() result built in a context that
+             * SPI_finish() frees before it's returned — a real, reproduced
+             * SIGSEGV at scale (task #17 testing, 2026-08-04).
+             */
+            MemoryContextSwitchTo(caller_ctx);
 
-        nrows    = SPI_processed;
-        pair_src = (int64 *) palloc((nrows > 0 ? nrows : 1) * sizeof(int64));
-        pair_dst = (int64 *) palloc((nrows > 0 ? nrows : 1) * sizeof(int64));
+            nrows    = SPI_processed;
+            pair_src = (int64 *) palloc((nrows > 0 ? nrows : 1) * sizeof(int64));
+            pair_dst = (int64 *) palloc((nrows > 0 ? nrows : 1) * sizeof(int64));
 
-        {
-            uint64 kept = 0;
-
-            for (i = 0; i < nrows; i++)
             {
-                bool  isnull;
-                int64 candidate = DatumGetInt64(
-                    SPI_getbinval(SPI_tuptable->vals[i],
-                                  SPI_tuptable->tupdesc, 1, &isnull));
+                uint64 kept = 0;
 
-                /*
-                 * graph_traverse() includes the start node itself as the
-                 * depth-0 entry of its result set (that's correct for its
-                 * own contract). For MATCH (n)-[:R]->(m), m is the far side
-                 * of the edge, not n — so drop the anchor's own id here or
-                 * every row would resolve m to the same node as n.
-                 */
-                if (candidate == start_id)
-                    continue;
+                for (i = 0; i < nrows; i++)
+                {
+                    bool  isnull;
+                    int64 candidate = DatumGetInt64(
+                        SPI_getbinval(SPI_tuptable->vals[i],
+                                      SPI_tuptable->tupdesc, 1, &isnull));
 
-                pair_src[kept] = start_id;
-                pair_dst[kept] = candidate;
-                kept++;
+                    /*
+                     * A cycle (e.g. start -> a -> start) could bring the
+                     * traversal back to the anchor's own id at depth >= 1,
+                     * which the CTE's depth filter alone wouldn't catch.
+                     * For MATCH (n)-[:R]->(m), m is the far side of the
+                     * edge, not n — so drop the anchor's own id here.
+                     */
+                    if (candidate == start_id)
+                        continue;
+
+                    pair_src[kept] = start_id;
+                    pair_dst[kept] = candidate;
+                    kept++;
+                }
+                nrows = kept;
             }
-            nrows = kept;
+        } else {
+            /*
+             * Default tables: pure-C BFS via the shared multi-seed helper
+             * (single seed here). It already tracks per-node depth and
+             * excludes the seed's own id, so min_depth enforcement and the
+             * anchor-exclusion both come for free.
+             */
+            int out_len = 0;
+
+            igraph_match_traverse_multi_internal(&start_id, 1, rel_type, direction,
+                                                 max_depth, min_depth,
+                                                 &pair_src, &pair_dst, &out_len);
+            nrows = (uint64) out_len;
         }
     } else {
         /*
@@ -1033,10 +1036,10 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
                 "  JOIN %s rt ON rt.id = e.rel_type "
                 "  WHERE tc.depth < %d AND rt.name = '%s' "
                 ") "
-                "SELECT DISTINCT root_id, id FROM traverse_cte WHERE depth > 0",
+                "SELECT DISTINCT root_id, id FROM traverse_cte WHERE depth >= %d",
                 direction ? "true" : "false", edges_table,
                 direction ? "true" : "false", direction ? "true" : "false",
-                rel_types_table, max_depth, rel_type);
+                rel_types_table, max_depth, rel_type, min_depth);
 
             {
                 Oid   argtypes[] = { INT8ARRAYOID };
@@ -1080,7 +1083,7 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
             int    c_len = 0;
 
             igraph_match_traverse_multi_internal(candidate_ids, (int) n_candidates,
-                                                 rel_type, direction, max_depth,
+                                                 rel_type, direction, max_depth, min_depth,
                                                  &c_src, &c_dst, &c_len);
             pair_src = c_src;
             pair_dst = c_dst;

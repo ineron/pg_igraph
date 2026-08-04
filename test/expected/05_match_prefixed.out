@@ -125,5 +125,4 @@ SELECT igraph_query('social.social_',
 -- silently-wrong data.
 -- ============================================================
 SELECT igraph_query(format('MATCH (n:Customer)-[:refers]->(m:Customer) WHERE n.id = %s', :c1));
-ERROR:  graph_traverse: unknown rel_type 'refers'
-CONTEXT:  SQL statement "SELECT * FROM graph_traverse($1,$2,$3,$4)"
+ERROR:  igraph_match_traverse_multi_internal: unknown rel_type 'refers'

@@ -75,12 +75,11 @@ SELECT graph_get_node_properties(:reftest_id);
 SELECT igraph_query('PATH FROM &data.a TO &data.b VIA rel');
 
 -- ============================================================
--- KNOWN BUG (unfiled): relationship depth minimum bound is parsed but
--- never enforced -- exec_match_ctx only ever reads rel->max_depth
--- (igraph_exec.c:843), never rel->min_depth. *2 (parsed as min=2,max=2,
--- "exactly 2 hops") actually returns *every* node from 1 hop up to 2,
--- identical to *1..2. Fixture: d1 -[:chain]-> d2 -[:chain]-> d3; *2 from
--- d1 should return only d3 (2 hops) but returns both d2 (1 hop) and d3.
+-- task #20 (fixed): relationship depth minimum bound is now enforced.
+-- *2 (parsed as min=2,max=2, "exactly 2 hops") returns only nodes whose
+-- shortest-path distance from the anchor is 2, not every node from 1
+-- hop up to 2. Fixture: d1 -[:chain]-> d2 -[:chain]-> d3; *2 from d1
+-- returns only d3.
 -- ============================================================
 SELECT graph_add_node('Depth') AS d1 \gset
 SELECT graph_add_node('Depth') AS d2 \gset

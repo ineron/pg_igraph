@@ -1546,7 +1546,8 @@ igraph_shortest_path_internal(int64  start_id,
  * Precondition: SPI must be open (caller owns SPI connection) — same
  * contract as igraph_shortest_path_internal above.
  * Result arrays (*out_src / *out_dst) are palloc'd in CurrentMemoryContext
- * (caller_ctx), one entry per (seed, reached-node) pair, depths 1..max_depth.
+ * (caller_ctx), one entry per (seed, reached-node) pair, depths
+ * min_depth..max_depth (pass min_depth=1 for "any depth up to max").
  * A seed's own id is never emitted (matches graph_traverse's convention of
  * excluding the start node from "reached" results); *out_len is set to 0
  * and both arrays left NULL if nothing was reached.
@@ -1554,7 +1555,7 @@ igraph_shortest_path_internal(int64  start_id,
 void
 igraph_match_traverse_multi_internal(int64 *seed_ids, int n_seeds,
                                       const char *rel_type, bool direction,
-                                      int max_depth,
+                                      int max_depth, int min_depth,
                                       int64 **out_src, int64 **out_dst,
                                       int *out_len)
 {
@@ -1566,6 +1567,9 @@ igraph_match_traverse_multi_internal(int64 *seed_ids, int n_seeds,
 
     if (n_seeds <= 0 || max_depth <= 0)
         return;
+
+    if (min_depth < 1)
+        min_depth = 1;
 
     MemoryContext work_ctx = AllocSetContextCreate(caller_ctx,
                                                     "igraph_match_multi_work",
@@ -1651,15 +1655,22 @@ igraph_match_traverse_multi_internal(int64 *seed_ids, int n_seeds,
                     }
                     next_level[next_size++] = nbr;
 
-                    if (out_size >= out_cap)
+                    /* nbr is being discovered at graph-depth (depth + 1)
+                     * here — only emit it if that's within [min_depth,
+                     * max_depth]; the upper bound is already guaranteed by
+                     * the outer `while (depth < max_depth ...)` loop. */
+                    if (depth + 1 >= min_depth)
                     {
-                        out_cap  *= 2;
-                        pair_src = (int64 *) repalloc(pair_src, out_cap * sizeof(int64));
-                        pair_dst = (int64 *) repalloc(pair_dst, out_cap * sizeof(int64));
+                        if (out_size >= out_cap)
+                        {
+                            out_cap  *= 2;
+                            pair_src = (int64 *) repalloc(pair_src, out_cap * sizeof(int64));
+                            pair_dst = (int64 *) repalloc(pair_dst, out_cap * sizeof(int64));
+                        }
+                        pair_src[out_size] = seed;
+                        pair_dst[out_size] = nbr;
+                        out_size++;
                     }
-                    pair_src[out_size] = seed;
-                    pair_dst[out_size] = nbr;
-                    out_size++;
                 }
             }
 

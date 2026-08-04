@@ -118,12 +118,11 @@ SELECT igraph_query('PATH FROM &data.a TO &data.b VIA rel');
 ERROR:  igraph syntax error: syntax error, unexpected TK_PARAM, expecting TK_INTEGER
 DETAIL:  At column 17 in: PATH FROM &data.a TO &data.b VIA rel
 -- ============================================================
--- KNOWN BUG (unfiled): relationship depth minimum bound is parsed but
--- never enforced -- exec_match_ctx only ever reads rel->max_depth
--- (igraph_exec.c:843), never rel->min_depth. *2 (parsed as min=2,max=2,
--- "exactly 2 hops") actually returns *every* node from 1 hop up to 2,
--- identical to *1..2. Fixture: d1 -[:chain]-> d2 -[:chain]-> d3; *2 from
--- d1 should return only d3 (2 hops) but returns both d2 (1 hop) and d3.
+-- task #20 (fixed): relationship depth minimum bound is now enforced.
+-- *2 (parsed as min=2,max=2, "exactly 2 hops") returns only nodes whose
+-- shortest-path distance from the anchor is 2, not every node from 1
+-- hop up to 2. Fixture: d1 -[:chain]-> d2 -[:chain]-> d3; *2 from d1
+-- returns only d3.
 -- ============================================================
 SELECT graph_add_node('Depth') AS d1 \gset
 SELECT graph_add_node('Depth') AS d2 \gset
@@ -153,9 +152,9 @@ SELECT graph_set_property(:d3, 'name', 2::smallint, str_to_bytea('D3'));
 (1 row)
 
 SELECT igraph_query(format('MATCH (n:Depth)-[:chain*2]->(m:Depth) WHERE n.id = %s RETURN m.name', :d1));
-             igraph_query             
---------------------------------------
- [{"m.name": "D2"}, {"m.name": "D3"}]
+    igraph_query    
+--------------------
+ [{"m.name": "D3"}]
 (1 row)
 
 -- ============================================================
