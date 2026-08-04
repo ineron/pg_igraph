@@ -166,6 +166,14 @@ exec_path(IgraphStmtPath *p)
             (errcode(ERRCODE_INTERNAL_ERROR),
              errmsg("igraph PATH: graph_shortest_path failed")));
 
+    /*
+     * SPI_execute_with_args() leaves CurrentMemoryContext pointing at
+     * SPI's own per-call context, not the caller's — json_buf below is
+     * read after SPI_finish() (which frees that context), so it must be
+     * built in caller_ctx. Same hazard/fix as exec_match_ctx (task #17).
+     */
+    MemoryContextSwitchTo(caller_ctx);
+
     /* Use StringInfo approach to build result safely */
     StringInfoData json_buf;
     initStringInfo(&json_buf);
@@ -457,6 +465,15 @@ get_node_property_value(int64 node_id, const char *prop_name, IgraphExecContext 
         ret = SPI_execute_with_args(query.data, 2, argtypes, args, NULL, true, 1);
     }
 
+    /*
+     * SPI_execute_with_args() leaves CurrentMemoryContext pointing at
+     * SPI's own per-call context, not the caller's — every value pulled
+     * out below (raw_bv copy, pstrdup'd string) must land in caller_ctx
+     * or it dangles once this function's SPI_finish() runs (same
+     * hazard/fix as exec_match_ctx, task #17).
+     */
+    MemoryContextSwitchTo(caller_ctx);
+
     if (ret == SPI_OK_SELECT && SPI_processed > 0) {
         HeapTuple tup = SPI_tuptable->vals[0];
         TupleDesc td  = SPI_tuptable->tupdesc;
@@ -481,6 +498,10 @@ get_node_property_value(int64 node_id, const char *prop_name, IgraphExecContext 
                 int    nret = SPI_execute_with_args(
                     "SELECT bytea_to_numeric($1)::text",
                     1, nargtypes, nargs, NULL, true, 1);
+
+                /* Same hazard as above — switch back before extracting
+                 * numeric_text from this nested call's result. */
+                MemoryContextSwitchTo(caller_ctx);
 
                 if (nret == SPI_OK_SELECT && SPI_processed > 0) {
                     bool  nisnull;
@@ -1246,6 +1267,7 @@ exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
 static Jsonb *
 exec_match_bare_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
 {
+    MemoryContext    caller_ctx = CurrentMemoryContext;
     int64            start_id;
     IgraphCond      *c;
     int              ret;
@@ -1279,6 +1301,7 @@ exec_match_bare_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
     }
 
     SPI_connect();
+    MemoryContextSwitchTo(caller_ctx);
 
     initStringInfo(&query);
     if (start_id >= 0 && m->src && m->src->label)
@@ -1324,6 +1347,15 @@ exec_match_bare_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
         ereport(ERROR,
             (errcode(ERRCODE_INTERNAL_ERROR),
              errmsg("igraph MATCH: bare node enumeration failed (ret=%d)", ret)));
+
+    /*
+     * SPI_execute()/SPI_execute_with_args() leave CurrentMemoryContext
+     * pointing at SPI's own per-call context, not the caller's — node_ids
+     * and the eventual jsonb_in() result must not be built there, or
+     * SPI_finish() below frees them out from under the return value
+     * (same hazard/fix as exec_match_ctx, task #17).
+     */
+    MemoryContextSwitchTo(caller_ctx);
 
     nrows    = SPI_processed;
     node_ids = (int64 *) palloc(nrows * sizeof(int64));
@@ -1380,6 +1412,11 @@ exec_match_bare_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx)
             Datum largs[] = { Int64GetDatum(nid) };
             lret = SPI_execute_with_args(label_query.data,
                                           1, la, largs, NULL, true, 1);
+            /* See the caller_ctx comment above the candidate-scan query —
+             * label must be pstrdup'd (via TextDatumGetCString) in the
+             * caller's context, not SPI's transient one, since it's used
+             * after SPI_finish() further down. */
+            MemoryContextSwitchTo(caller_ctx);
             if (lret == SPI_OK_SELECT && SPI_processed > 0)
                 label = TextDatumGetCString(
                     SPI_getbinval(SPI_tuptable->vals[0],
@@ -1742,6 +1779,15 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
                 "SELECT str_to_bytea($1)", 1, argtypes, args, NULL, true, 1);
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
                 ereport(ERROR, (errmsg("igraph SET: str_to_bytea failed")));
+            /*
+             * SPI_execute_with_args() leaves CurrentMemoryContext pointing
+             * at SPI's own per-call context, not the caller's — value_bytea
+             * is passed into the graph_set_property() SPI call further
+             * down, so its copy must land in caller_ctx or it dangles by
+             * the time that second call reads it (same hazard/fix as
+             * exec_match_ctx, task #17).
+             */
+            MemoryContextSwitchTo(caller_ctx);
             value_bytea = DatumGetByteaPCopy(
                 SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
             break;
@@ -1757,6 +1803,8 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
                 2, argtypes, args, NULL, true, 1);
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
                 ereport(ERROR, (errmsg("igraph SET: numeric_to_bytea failed")));
+            /* See the caller_ctx comment in the STRING branch above. */
+            MemoryContextSwitchTo(caller_ctx);
             value_bytea = DatumGetByteaPCopy(
                 SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
             break;
@@ -1780,6 +1828,8 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
                 1, argtypes, args, NULL, true, 1);
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
                 ereport(ERROR, (errmsg("igraph SET: numeric_to_bytea failed")));
+            /* See the caller_ctx comment in the STRING branch above. */
+            MemoryContextSwitchTo(caller_ctx);
             value_bytea = DatumGetByteaPCopy(
                 SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
             break;
@@ -1794,6 +1844,8 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
                 "SELECT bool_to_bytea($1)", 1, argtypes, args, NULL, true, 1);
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
                 ereport(ERROR, (errmsg("igraph SET: bool_to_bytea failed")));
+            /* See the caller_ctx comment in the STRING branch above. */
+            MemoryContextSwitchTo(caller_ctx);
             value_bytea = DatumGetByteaPCopy(
                 SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
             break;
@@ -1878,12 +1930,23 @@ exec_get_props_ctx(IgraphStmtGetProps *gp, IgraphExecContext *ctx)
             (errcode(ERRCODE_INTERNAL_ERROR),
              errmsg("igraph GET PROPERTIES: graph_get_node_properties failed")));
 
+    /*
+     * SPI_execute_with_args() leaves CurrentMemoryContext pointing at
+     * SPI's own per-call context, not the caller's (same hazard/fix as
+     * exec_match_ctx, task #17). That alone isn't enough here though:
+     * DatumGetJsonbP() doesn't copy when the value isn't toasted, so
+     * `props` would still just point into SPI's tuple memory, which
+     * SPI_finish() below frees before `props->root` is read further
+     * down — use DatumGetJsonbPCopy() to force an actual copy.
+     */
+    MemoryContextSwitchTo(caller_ctx);
+
     Datum d = SPI_getbinval(SPI_tuptable->vals[0],
                             SPI_tuptable->tupdesc, 1, &isnull);
     if (isnull)
         props = NULL;
     else
-        props = DatumGetJsonbP(d);
+        props = DatumGetJsonbPCopy(d);
 
     SPI_finish();
 
