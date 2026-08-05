@@ -40,10 +40,13 @@ SELECT igraph_query('
 SELECT igraph_query('PATH FROM 100 TO 500 VIA FOLLOWS');
 
 -- 🆕 NEW in v1.1: Multiple graphs with table prefixes
--- Prefixed tables must exist first (one-time setup per graph instance):
+-- Prefixed tables must exist first (one-time setup per graph instance) —
+-- either the shell script:
 --   ./init_graph.sh --prefix social_network
--- The prefix argument must include the trailing underscore that
--- init_graph.sh appends to every table name it creates:
+-- or, 🆕 NEW in v1.2, entirely from SQL (no filesystem/shell access needed):
+--   SELECT graph_provision_schema('social_network_');
+-- The prefix argument must include the trailing underscore that both
+-- appends to every table name they create:
 SELECT graph_add_node('User', 'social_network_');
 
 -- 🆕 NEW in v1.1: JSON parameters with enhanced WHERE clauses
@@ -103,6 +106,13 @@ SELECT igraph_query('',
 - **Prefix Format**: Pass the prefix **with its trailing underscore** (e.g. `'social_network_'`) to `graph_add_node`/`igraph_query`/etc. — it's concatenated directly onto table names, not auto-separated
 - **Independent Graphs**: Isolated data and operations
 
+## 🆕 Version 1.2 Features
+
+### SQL-Callable Schema Provisioning
+- **`graph_provision_schema(table_prefix DEFAULT '', partitions DEFAULT 16)`**: Creates a graph instance's backing tables (nodes, edges, properties, complex types, partitions and indexes) directly from SQL — the same schema `init_graph.sh` builds, but usable from a session with no filesystem/shell/`.env` access (e.g. an application's own portal-role connection).
+- **Same prefix contract**: `''` for the bare tables, `'myprefix_'` for prefixed tables in the current schema, or `'myschema.myprefix_'` to provision into (and auto-create) a dedicated schema — identical to what `graph_add_node`/`igraph_query`/etc. already accept.
+- **Idempotent**: safe to call again for an existing prefix; existing tables/indexes/partitions are left untouched.
+
 ## 🏗️ Architecture Highlights
 
 - **Dual-Direction Storage**: Forward and reverse edges for optimal access
@@ -131,6 +141,10 @@ See [detailed benchmark results](docs/benchmarks.md) for more performance data.
 
 ### Core Functions
 ```sql
+-- Schema provisioning (creates a graph instance's backing tables from SQL —
+-- same prefix contract as the functions below, no shell/filesystem access needed)
+graph_provision_schema(table_prefix DEFAULT '', partitions DEFAULT 16) → VOID
+
 -- Graph management
 graph_add_node(label, table_prefix DEFAULT '') → BIGINT
 graph_add_edge(from_id, to_id, relationship, table_prefix DEFAULT '') → VOID

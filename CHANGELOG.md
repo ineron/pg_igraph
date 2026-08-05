@@ -5,6 +5,11 @@ All notable changes to pg_igraph will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-05
+
+### Added
+- **SQL-Callable Schema Provisioning**: `graph_provision_schema(table_prefix DEFAULT '', partitions DEFAULT 16)` creates a graph instance's backing tables (nodes, edges, properties, complex types, partitions, indexes) entirely from SQL — the same schema `init_graph.sh` builds, but usable from a session with no filesystem/shell/`.env` access. Accepts the same `table_prefix` contract as `graph_add_node`/`igraph_query`/etc. (`''`, `'myprefix_'`, or `'myschema.myprefix_'`, auto-creating the schema if needed), and is idempotent — safe to call again on an existing prefix.
+
 ## [1.1.0] - 2026-05-31
 
 ### Added
