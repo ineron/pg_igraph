@@ -1,8 +1,9 @@
 -- graph_traverse / graph_shortest_path / PATH FROM..TO..VIA (query language),
--- over the default (unprefixed) graph only — neither function is
--- prefix-aware (pg_igraph--1.1.sql explicit TODO at graph_shortest_path's
--- prefixed form; PATH's prefixed-graph behavior is covered separately in
--- 07_known_bugs_and_regressions.sql since it's a documented stub).
+-- over the default (unprefixed) graph only — graph_shortest_path() itself
+-- is still not prefix-aware (pg_igraph--1.1.sql explicit TODO), but the
+-- query-language PATH statement now has its own prefixed-graph CTE path
+-- (task #15, exec_path_ctx); that behavior is covered separately in
+-- 07_known_bugs_and_regressions.sql's REGRESSION ANCHORS section.
 --
 -- Fixture: a 4-node chain a -[follows]-> b -[follows]-> c -[follows]-> d
 

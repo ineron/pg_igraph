@@ -18,6 +18,14 @@
 
 #include "igraph_query.h"
 
+/*
+ * Hard safety cap on recursion depth for exec_path_ctx's prefixed-table
+ * shortest-path CTE (no C-level adjacency engine exists for dynamic table
+ * names, so unlike the default table's bidirectional C BFS, this walks a
+ * recursive CTE and needs an explicit bound).
+ */
+#define IGRAPH_PATH_MAX_DEPTH 1000
+
 /* ── Forward declarations ──────────────────────── */
 static char *build_table_name(const char *base_name, IgraphExecContext *ctx);
 static Jsonb *exec_match_ctx(IgraphStmtMatch *m, IgraphExecContext *ctx);
@@ -1507,17 +1515,124 @@ static Jsonb *
 exec_path_ctx(IgraphStmtPath *p, IgraphExecContext *ctx)
 {
     if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0) {
-        /* For now: PATH queries with table prefixes use a fallback approach */
-        /* TODO: Implement full CTE-based shortest path for prefixed tables */
-        StringInfoData json_buf;
+        /*
+         * Prefixed graphs have no C-level adjacency engine (build_adj_list /
+         * igraph_shortest_path_internal only know the hardcoded default
+         * edges/rel_types tables — same limitation documented on MATCH's
+         * prefixed branch above). Shortest path is a single-direction
+         * (direction=true, matching graph_shortest_path's forward BFS)
+         * recursive CTE instead, picking the minimum-depth row that reaches
+         * end_id. NOT (e.to_id = ANY(path)) prevents the recursion from
+         * looping through a cycle back onto a node already in the path;
+         * IGRAPH_PATH_MAX_DEPTH is a hard safety cap so a large or densely
+         * cyclic prefixed graph can't make this recurse unboundedly.
+         */
+        MemoryContext    caller_ctx = CurrentMemoryContext;
+        char            *edges_table;
+        char            *rel_types_table;
+        StringInfoData   query;
+        StringInfoData   json_buf;
+        int              ret;
+        Datum            jsonb_datum;
+        Jsonb           *result;
+
+        if (p->start_id == p->end_id) {
+            initStringInfo(&json_buf);
+            appendStringInfo(&json_buf,
+                "{\"hops\": 0, \"path\": [%ld], \"found\": true, \"status\": \"ok\"}",
+                p->start_id);
+            jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json_buf.data));
+            result = DatumGetJsonbP(jsonb_datum);
+            pfree(json_buf.data);
+            return result;
+        }
+
+        edges_table     = build_table_name("edges", ctx);
+        rel_types_table = build_table_name("rel_types", ctx);
+
+        initStringInfo(&query);
+        appendStringInfo(&query,
+            "WITH RECURSIVE path_cte AS ("
+            "  SELECT $1::bigint AS id, ARRAY[$1::bigint] AS path, 0 AS depth "
+            "  UNION ALL "
+            "  SELECT e.to_id, pc.path || e.to_id, pc.depth + 1 "
+            "  FROM path_cte pc "
+            "  JOIN %s e ON e.from_id = pc.id AND e.direction = true "
+            "  JOIN %s rt ON rt.id = e.rel_type "
+            "  WHERE pc.depth < %d AND rt.name = '%s' "
+            "    AND NOT (e.to_id = ANY(pc.path)) "
+            ") "
+            "SELECT path, depth FROM path_cte WHERE id = $2 ORDER BY depth ASC LIMIT 1",
+            edges_table, rel_types_table, IGRAPH_PATH_MAX_DEPTH, p->rel_type);
+
+        SPI_connect();
+        MemoryContextSwitchTo(caller_ctx);
+
+        {
+            Oid   argtypes[] = { INT8OID, INT8OID };
+            Datum args[]     = { Int64GetDatum(p->start_id), Int64GetDatum(p->end_id) };
+            ret = SPI_execute_with_args(query.data, 2, argtypes, args, NULL, true, 1);
+        }
+
+        pfree(query.data);
+        pfree(edges_table);
+        pfree(rel_types_table);
+
+        if (ret != SPI_OK_SELECT)
+            ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("igraph PATH: prefixed shortest-path CTE failed (ret=%d)", ret)));
+
+        /*
+         * SPI_execute_with_args() leaves CurrentMemoryContext pointing at
+         * SPI's own per-call context, not the caller's — json_buf below is
+         * read after SPI_finish() (which frees that context), so it must be
+         * built in caller_ctx. Same hazard/fix as exec_match_ctx (task #17)
+         * and exec_path above.
+         */
+        MemoryContextSwitchTo(caller_ctx);
+
         initStringInfo(&json_buf);
 
-        /* Return "not found" for prefixed tables temporarily */
-        appendStringInfo(&json_buf, "{\"path\": [], \"found\": false, \"status\": \"ok\", \"note\": \"PATH with table prefixes: basic support\"}");
+        if (SPI_processed == 0) {
+            appendStringInfo(&json_buf, "{\"path\": [], \"found\": false, \"status\": \"ok\"}");
+        } else {
+            bool       isnull;
+            Datum      path_datum = SPI_getbinval(SPI_tuptable->vals[0],
+                                                   SPI_tuptable->tupdesc, 1, &isnull);
 
-        /* Convert to JSONB safely */
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json_buf.data));
-        Jsonb *result = DatumGetJsonbP(jsonb_datum);
+            if (isnull) {
+                appendStringInfo(&json_buf, "{\"path\": [], \"found\": false, \"status\": \"ok\"}");
+            } else {
+                ArrayType *path_array = DatumGetArrayTypeP(path_datum);
+                int16      elmlen;
+                bool       elmbyval;
+                char       elmalign;
+                int        nitems;
+                Datum     *elems;
+                bool      *nulls;
+
+                get_typlenbyvalalign(INT8OID, &elmlen, &elmbyval, &elmalign);
+                deconstruct_array(path_array, INT8OID, elmlen, elmbyval, elmalign,
+                                  &elems, &nulls, &nitems);
+
+                appendStringInfo(&json_buf, "{\"path\": [");
+                for (int i = 0; i < nitems; i++) {
+                    if (i > 0) appendStringInfo(&json_buf, ", ");
+                    appendStringInfo(&json_buf, "%ld", DatumGetInt64(elems[i]));
+                }
+                appendStringInfo(&json_buf, "], \"found\": true, \"hops\": %d, \"status\": \"ok\"}",
+                               nitems > 0 ? nitems - 1 : 0);
+
+                pfree(elems);
+                pfree(nulls);
+            }
+        }
+
+        SPI_finish();
+
+        jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json_buf.data));
+        result = DatumGetJsonbP(jsonb_datum);
 
         pfree(json_buf.data);
         return result;

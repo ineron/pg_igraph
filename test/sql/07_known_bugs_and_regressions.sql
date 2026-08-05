@@ -10,17 +10,6 @@
 -- of them fails loudly here instead of waiting to be rediscovered by hand.
 
 -- ============================================================
--- KNOWN BUG (task #15): PATH FROM/TO/VIA over a prefixed graph is a
--- hardcoded stub -- exec_path_ctx (igraph_exec.c ~1127-1149) never runs
--- the real BFS for a non-empty table_prefix; it always returns this
--- exact object regardless of whether a path actually exists.
--- ============================================================
-SELECT graph_add_node('Customer', 'shop_') AS pc1 \gset
-SELECT graph_add_node('Customer', 'shop_') AS pc2 \gset
-SELECT graph_add_edge(:pc1, :pc2, 'refers', 'shop_');
-SELECT igraph_query('shop_', format('PATH FROM %s TO %s VIA refers', :pc1, :pc2), NULL::jsonb);
-
--- ============================================================
 -- FIXED (task #17, 2026-08-04): MATCH with no WHERE anchor used to skip
 -- the edge walk entirely -- exec_match_ctx's start_id<0 branch did a
 -- label scan and returned every matching node directly as if it were
@@ -217,3 +206,19 @@ SELECT graph_set_property(:um2, 'name', 2::smallint, str_to_bytea('M2'));
 SELECT graph_set_property(:um3, 'name', 2::smallint, str_to_bytea('M3'));
 SELECT graph_set_property(:um4, 'name', 2::smallint, str_to_bytea('M4'));
 SELECT igraph_query('MATCH (n:UnanchoredMulti)-[:mlink]->(m:UnanchoredMulti) RETURN n.name, m.name');
+
+-- task #15 (fixed): PATH FROM/TO/VIA over a prefixed graph used to be a
+-- hardcoded stub -- exec_path_ctx (igraph_exec.c) never ran a real search
+-- for a non-empty table_prefix, always returning the same
+-- {"path": [], "found": false, ...} object regardless of whether a path
+-- actually existed. No C-level adjacency engine exists for dynamic
+-- (prefixed) table names, so this is a single-direction (direction=true)
+-- recursive CTE rather than the default table's bidirectional C BFS --
+-- mirrors MATCH's prefixed-CTE direction filter (task #17's gotcha: the
+-- edge join must filter on e.direction or a reverse-storage row can be
+-- walked as if it were forward, producing a false/reversed path).
+SELECT graph_add_node('Customer', 'shop_') AS pc1 \gset
+SELECT graph_add_node('Customer', 'shop_') AS pc2 \gset
+SELECT graph_add_edge(:pc1, :pc2, 'refers', 'shop_');
+SELECT igraph_query('shop_', format('PATH FROM %s TO %s VIA refers', :pc1, :pc2), NULL::jsonb);
+SELECT igraph_query('shop_', format('PATH FROM %s TO %s VIA refers', :pc2, :pc1), NULL::jsonb);
