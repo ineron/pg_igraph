@@ -40,10 +40,15 @@ SELECT igraph_query('
 SELECT igraph_query('PATH FROM 100 TO 500 VIA FOLLOWS');
 
 -- 🆕 NEW in v1.1: Multiple graphs with table prefixes
-SELECT graph_add_node('User', 'social_network');
+-- Prefixed tables must exist first (one-time setup per graph instance):
+--   ./init_graph.sh --prefix social_network
+-- The prefix argument must include the trailing underscore that
+-- init_graph.sh appends to every table name it creates:
+SELECT graph_add_node('User', 'social_network_');
 
 -- 🆕 NEW in v1.1: JSON parameters with enhanced WHERE clauses
-SELECT igraph_query('network', 
+-- (default, unprefixed graph — see the table-prefix example above for '<prefix>_' graphs)
+SELECT igraph_query('', 
   'MATCH (u:User)-[:FOLLOWS]->(f) 
    WHERE f.influence > &data.threshold AND u.id != &data.exclude_id 
    RETURN f.name',
@@ -94,8 +99,8 @@ SELECT igraph_query('',
 - **Library-Ready**: Perfect for integration into larger systems
 
 ### Multi-Graph Support
-- **Table Prefixes**: Support multiple graph instances
-- **Schema Separation**: `"schema.prefix_"` format
+- **Table Prefixes**: Support multiple graph instances, each with its own set of `<prefix>_nodes`, `<prefix>_edges`, etc. tables created via `./init_graph.sh --prefix <name>`
+- **Prefix Format**: Pass the prefix **with its trailing underscore** (e.g. `'social_network_'`) to `graph_add_node`/`igraph_query`/etc. — it's concatenated directly onto table names, not auto-separated
 - **Independent Graphs**: Isolated data and operations
 
 ## 🏗️ Architecture Highlights
@@ -134,12 +139,15 @@ graph_add_edge(from_id, to_id, relationship, table_prefix DEFAULT '') → VOID
 graph_traverse(start, rel, direction, max_depth) → SETOF BIGINT
 graph_shortest_path(start, end, rel) → BIGINT[]
 
--- Properties
-graph_set_property(node_id, prop_name, type, value, table_prefix DEFAULT '') → VOID
-graph_get_property(node_id, prop_name, table_prefix DEFAULT '') → TEXT
+-- Properties (primitive: 1=bigint, 2=text, 3=uuid, 4=timestamp, 5=bool,
+-- 6=numeric, 7=jsonb — value must be pre-encoded with the matching
+-- pg_ilib *_to_bytea() function; ref_label labels the property as a
+-- typed reference to another node's label, or pass NULL for a plain value)
+graph_set_property(node_id, prop_name, primitive, value, ref_label DEFAULT NULL, table_prefix DEFAULT '') → VOID
+graph_get_property(node_id, prop_name, table_prefix DEFAULT '') → BYTEA  -- raw pg_ilib payload; decode via graph_get_node_properties() for readable JSON
 
 -- External integration
-graph_resolve_ref(uuid, type, resolver_func) → JSONB
+graph_resolve_ref(ref_uuid uuid, ref_type text) → JSONB
 ```
 
 ### Query Language
@@ -149,8 +157,9 @@ MATCH (n:Label)-[:REL*1..5]->(m)
 WHERE n.prop > &data.threshold AND m.id != &data.exclude
 RETURN m
 
--- Path finding  
-PATH FROM &data.start_id TO &data.end_id VIA &data.relationship
+-- Path finding (FROM/TO take literal integer node ids, VIA a bare
+-- relationship-type identifier — none of the three accept &data.* params)
+PATH FROM 100 TO 500 VIA FOLLOWS
 
 -- Node creation with references
 CREATE (n:Type REF External = &data.external_uuid)
@@ -219,8 +228,9 @@ work_mem = 256MB
 -- Create nodes with external references
 CREATE (order:Order REF User = &data.user_uuid);
 
--- Resolve references through external systems
-SELECT graph_resolve_ref(uuid, 'User', 'external_resolver_function');
+-- Resolve references through external systems (2 args — no resolver-function
+-- argument; the resolver used is fixed per ref_type, not passed at call time)
+SELECT graph_resolve_ref(uuid, 'User');
 ```
 
 ### Custom Resolvers

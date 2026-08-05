@@ -16,8 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Property System Enhancement**: Full table prefix support for property operations
 
 ### Changed
-- **Clean Response Format**: Removed unnecessary `"status": "ok"` field from responses
-- **Response Structure**: Returns pure arrays `[{...}]` for data or empty objects `{}`
+- **Clean Response Format**: `MATCH`/`RETURN` queries return pure arrays `[{...}]` for data or empty objects `{}`, with no `"status"` field. `CREATE`, `DELETE`, `SET`, and `PATH` statements still include `"status": "ok"` in their response — that field was not removed project-wide, only from row-returning queries.
 - **Default Version**: Set v1.1 as default extension version
 
 ### Fixed
