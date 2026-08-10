@@ -11,12 +11,62 @@
 #include "utils/memutils.h"
 #include "lib/stringinfo.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_extension.h"
+#include "commands/extension.h"
 #include "utils/numeric.h"
 #include "utils/array.h"
 #include "utils/json.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 #include "igraph_query.h"
+
+/*
+ * Internal SPI calls below invoke this extension's own SQL-visible
+ * functions (graph_add_node, graph_set_property, ...) and pg_ilib's
+ * (str_to_bytea, bool_to_bytea, ...) by name. Both used to be issued
+ * unqualified, which only resolved when the connecting role's
+ * search_path happened to include the schema each extension was
+ * installed into — silently breaking for any role/DB whose search_path
+ * doesn't (reported via cross-project thread 172, pg_ipl, 2026-08-10).
+ * Resolve the actual install schema from pg_extension instead of relying
+ * on caller search_path.
+ */
+static char *
+igraph_extension_schema_qualifier(const char *extname)
+{
+    Oid       extoid;
+    HeapTuple tup;
+    Oid       nspoid;
+    char     *nspname;
+
+    extoid = get_extension_oid(extname, true);
+    if (!OidIsValid(extoid))
+        return pstrdup("");
+
+    tup = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(extoid));
+    if (!HeapTupleIsValid(tup))
+        return pstrdup("");
+
+    nspoid = ((Form_pg_extension) GETSTRUCT(tup))->extnamespace;
+    ReleaseSysCache(tup);
+
+    nspname = get_namespace_name(nspoid);
+    if (nspname == NULL)
+        return pstrdup("");
+
+    return psprintf("%s.", quote_identifier(nspname));
+}
+
+/* Build "SELECT <schema-qualified funcname_and_args>" for extname's own functions. */
+static char *
+igraph_qualify_call(const char *extname, const char *funcname_and_args)
+{
+    char *schema = igraph_extension_schema_qualifier(extname);
+    char *sql    = psprintf("SELECT %s%s", schema, funcname_and_args);
+    pfree(schema);
+    return sql;
+}
 
 /*
  * Hard safety cap on recursion depth for exec_path_ctx's prefixed-table
@@ -164,9 +214,11 @@ exec_path(IgraphStmtPath *p)
             Int64GetDatum(p->end_id),
             CStringGetTextDatum(p->rel_type)
         };
+        char *sql = igraph_qualify_call("pg_igraph", "graph_shortest_path($1, $2, $3)");
         ret = SPI_execute_with_args(
-            "SELECT graph_shortest_path($1, $2, $3)",
+            sql,
             3, argtypes, args, NULL, true, 1);
+        pfree(sql);
     }
 
     if (ret != SPI_OK_SELECT)
@@ -263,9 +315,13 @@ exec_delete_node(IgraphStmtDeleteNode *dn)
 
     SPI_connect();
     MemoryContextSwitchTo(caller_ctx);
-    ret = SPI_execute_with_args(
-        "SELECT graph_delete_node($1)",
-        1, argtypes, args, NULL, false, 0);
+    {
+        char *sql = igraph_qualify_call("pg_igraph", "graph_delete_node($1)");
+        ret = SPI_execute_with_args(
+            sql,
+            1, argtypes, args, NULL, false, 0);
+        pfree(sql);
+    }
     SPI_finish();
 
     if (ret != SPI_OK_SELECT && ret != SPI_OK_UTILITY)
@@ -324,9 +380,13 @@ exec_get_props(IgraphStmtGetProps *gp)
 
     SPI_connect();
     MemoryContextSwitchTo(caller_ctx);
-    ret = SPI_execute_with_args(
-        "SELECT graph_get_node_properties($1)",
-        1, argtypes, args, NULL, true, 1);
+    {
+        char *sql = igraph_qualify_call("pg_igraph", "graph_get_node_properties($1)");
+        ret = SPI_execute_with_args(
+            sql,
+            1, argtypes, args, NULL, true, 1);
+        pfree(sql);
+    }
 
     if (ret != SPI_OK_SELECT)
         ereport(ERROR,
@@ -432,28 +492,30 @@ get_node_property_value(int64 node_id, const char *prop_name, IgraphExecContext 
      */
     char *node_properties_table = build_table_name("node_properties", ctx);
     char *property_types_table  = build_table_name("property_types", ctx);
+    char *pg_igraph_schema      = igraph_extension_schema_qualifier("pg_igraph");
     StringInfoData query;
     initStringInfo(&query);
 
     if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0) {
         appendStringInfo(&query,
-            "SELECT graph_get_node_properties($1, $3) ->> $2, "
+            "SELECT %sgraph_get_node_properties($1, $3) ->> $2, "
             "CASE WHEN octet_length(np.value) >= 2 THEN get_byte(np.value,0) >> 4 END, "
             "CASE WHEN octet_length(np.value) >= 2 THEN ((get_byte(np.value,0) & 15) << 8) | get_byte(np.value,1) END, "
             "np.value "
             "FROM %s np JOIN %s pt ON pt.id = np.prop_id "
             "WHERE np.node_id = $1 AND pt.name = $2",
-            node_properties_table, property_types_table);
+            pg_igraph_schema, node_properties_table, property_types_table);
     } else {
         appendStringInfo(&query,
-            "SELECT graph_get_node_properties($1) ->> $2, "
+            "SELECT %sgraph_get_node_properties($1) ->> $2, "
             "CASE WHEN octet_length(np.value) >= 2 THEN get_byte(np.value,0) >> 4 END, "
             "CASE WHEN octet_length(np.value) >= 2 THEN ((get_byte(np.value,0) & 15) << 8) | get_byte(np.value,1) END, "
             "np.value "
             "FROM %s np JOIN %s pt ON pt.id = np.prop_id "
             "WHERE np.node_id = $1 AND pt.name = $2",
-            node_properties_table, property_types_table);
+            pg_igraph_schema, node_properties_table, property_types_table);
     }
+    pfree(pg_igraph_schema);
 
     /* Execute query */
     if (ctx && ctx->table_prefix && strlen(ctx->table_prefix) > 0) {
@@ -503,9 +565,11 @@ get_node_property_value(int64 node_id, const char *prop_name, IgraphExecContext 
                 bytea *raw_bv = DatumGetByteaPCopy(raw_d);
                 Oid    nargtypes[] = { BYTEAOID };
                 Datum  nargs[]     = { PointerGetDatum(raw_bv) };
+                char  *nsql = igraph_qualify_call("pg_ilib", "bytea_to_numeric($1)::text");
                 int    nret = SPI_execute_with_args(
-                    "SELECT bytea_to_numeric($1)::text",
+                    nsql,
                     1, nargtypes, nargs, NULL, true, 1);
+                pfree(nsql);
 
                 /* Same hazard as above — switch back before extracting
                  * numeric_text from this nested call's result. */
@@ -1661,16 +1725,20 @@ exec_create_node_ctx(IgraphStmtCreateNode *cn, IgraphExecContext *ctx)
                 CStringGetTextDatum(cn->label),
                 CStringGetTextDatum(ctx->table_prefix)
             };
+            char *sql = igraph_qualify_call("pg_igraph", "graph_add_node($1, $2)");
             ret = SPI_execute_with_args(
-                "SELECT graph_add_node($1, $2)",
+                sql,
                 2, argtypes, args, NULL, false, 1);
+            pfree(sql);
         } else {
             /* Use standard function for default tables (v1.0 compatibility) */
             Oid   argtypes[] = { TEXTOID };
             Datum args[]     = { CStringGetTextDatum(cn->label) };
+            char *sql = igraph_qualify_call("pg_igraph", "graph_add_node($1)");
             ret = SPI_execute_with_args(
-                "SELECT graph_add_node($1)",
+                sql,
                 1, argtypes, args, NULL, false, 1);
+            pfree(sql);
         }
     }
 
@@ -1714,9 +1782,11 @@ exec_create_edge_ctx(IgraphStmtCreateEdge *ce, IgraphExecContext *ctx)
                 CStringGetTextDatum(ce->rel_type),
                 CStringGetTextDatum(ctx->table_prefix)
             };
+            char *sql = igraph_qualify_call("pg_igraph", "graph_add_edge($1,$2,$3,$4)");
             ret = SPI_execute_with_args(
-                "SELECT graph_add_edge($1,$2,$3,$4)",
+                sql,
                 4, argtypes, args, NULL, false, 0);
+            pfree(sql);
         } else {
             /* Use standard function for default tables (v1.0 compatibility) */
             Oid   argtypes[] = { INT8OID, INT8OID, TEXTOID };
@@ -1725,9 +1795,11 @@ exec_create_edge_ctx(IgraphStmtCreateEdge *ce, IgraphExecContext *ctx)
                 Int64GetDatum(ce->to_id),
                 CStringGetTextDatum(ce->rel_type)
             };
+            char *sql = igraph_qualify_call("pg_igraph", "graph_add_edge($1,$2,$3)");
             ret = SPI_execute_with_args(
-                "SELECT graph_add_edge($1,$2,$3)",
+                sql,
                 3, argtypes, args, NULL, false, 0);
+            pfree(sql);
         }
     }
 
@@ -1757,16 +1829,20 @@ exec_delete_node_ctx(IgraphStmtDeleteNode *dn, IgraphExecContext *ctx)
                 Int64GetDatum(dn->node_id),
                 CStringGetTextDatum(ctx->table_prefix)
             };
+            char *sql = igraph_qualify_call("pg_igraph", "graph_delete_node($1, $2)");
             ret = SPI_execute_with_args(
-                "SELECT graph_delete_node($1, $2)",
+                sql,
                 2, argtypes, args, NULL, false, 0);
+            pfree(sql);
         } else {
             /* Use standard function for default tables (v1.0 compatibility) */
             Oid   argtypes[] = { INT8OID };
             Datum args[]     = { Int64GetDatum(dn->node_id) };
+            char *sql = igraph_qualify_call("pg_igraph", "graph_delete_node($1)");
             ret = SPI_execute_with_args(
-                "SELECT graph_delete_node($1)",
+                sql,
                 1, argtypes, args, NULL, false, 0);
+            pfree(sql);
         }
     }
 
@@ -1864,9 +1940,11 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
             Int64GetDatum(sp->node_id),
             CStringGetTextDatum(sp->prop_name)
         };
+        char *sql = igraph_qualify_call("pg_igraph", "graph_delete_property($1,$2)");
         ret = SPI_execute_with_args(
-            "SELECT graph_delete_property($1,$2)",
+            sql,
             2, argtypes, args, NULL, false, 0);
+        pfree(sql);
 
         if (ret != SPI_OK_SELECT)
             ereport(ERROR,
@@ -1892,9 +1970,11 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
             Oid   argtypes[] = { TEXTOID };
             Datum args[]     = { CStringGetTextDatum(resolved_val.sval) };
 
+            char *sql = igraph_qualify_call("pg_ilib", "str_to_bytea($1)");
             primitive = 2; /* text */
             ret = SPI_execute_with_args(
-                "SELECT str_to_bytea($1)", 1, argtypes, args, NULL, true, 1);
+                sql, 1, argtypes, args, NULL, true, 1);
+            pfree(sql);
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
                 ereport(ERROR, (errmsg("igraph SET: str_to_bytea failed")));
             /*
@@ -1915,10 +1995,12 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
             Oid   argtypes[] = { INT8OID, INT4OID };
             Datum args[]     = { Int64GetDatum(resolved_val.ival), Int32GetDatum(0) };
 
+            char *sql = igraph_qualify_call("pg_ilib", "numeric_to_bytea($1::numeric,$2)");
             primitive = 1; /* bigint */
             ret = SPI_execute_with_args(
-                "SELECT numeric_to_bytea($1::numeric,$2)",
+                sql,
                 2, argtypes, args, NULL, true, 1);
+            pfree(sql);
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
                 ereport(ERROR, (errmsg("igraph SET: numeric_to_bytea failed")));
             /* See the caller_ctx comment in the STRING branch above. */
@@ -1941,9 +2023,12 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
              * digit). scale($1::numeric) derives the real digit count
              * instead of guessing a fixed value.
              */
+            char *sql = igraph_qualify_call("pg_ilib",
+                "numeric_to_bytea($1::numeric, scale($1::numeric))");
             ret = SPI_execute_with_args(
-                "SELECT numeric_to_bytea($1::numeric, scale($1::numeric))",
+                sql,
                 1, argtypes, args, NULL, true, 1);
+            pfree(sql);
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
                 ereport(ERROR, (errmsg("igraph SET: numeric_to_bytea failed")));
             /* See the caller_ctx comment in the STRING branch above. */
@@ -1957,9 +2042,11 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
             Oid   argtypes[] = { BOOLOID };
             Datum args[]     = { BoolGetDatum(resolved_val.bval) };
 
+            char *sql = igraph_qualify_call("pg_ilib", "bool_to_bytea($1)");
             primitive = 5; /* bool */
             ret = SPI_execute_with_args(
-                "SELECT bool_to_bytea($1)", 1, argtypes, args, NULL, true, 1);
+                sql, 1, argtypes, args, NULL, true, 1);
+            pfree(sql);
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
                 ereport(ERROR, (errmsg("igraph SET: bool_to_bytea failed")));
             /* See the caller_ctx comment in the STRING branch above. */
@@ -1984,9 +2071,11 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
             PointerGetDatum(value_bytea),
             CStringGetTextDatum(ctx->table_prefix)
         };
+        char *sql = igraph_qualify_call("pg_igraph", "graph_set_property($1,$2,$3,$4,NULL,$5)");
         ret = SPI_execute_with_args(
-            "SELECT graph_set_property($1,$2,$3,$4,NULL,$5)",
+            sql,
             5, argtypes, args, NULL, false, 0);
+        pfree(sql);
     }
     else
     {
@@ -1997,9 +2086,11 @@ exec_set_prop_ctx(IgraphStmtSetProp *sp, IgraphExecContext *ctx)
             Int16GetDatum(primitive),
             PointerGetDatum(value_bytea)
         };
+        char *sql = igraph_qualify_call("pg_igraph", "graph_set_property($1,$2,$3,$4,NULL)");
         ret = SPI_execute_with_args(
-            "SELECT graph_set_property($1,$2,$3,$4,NULL)",
+            sql,
             4, argtypes, args, NULL, false, 0);
+        pfree(sql);
     }
 
     if (ret != SPI_OK_SELECT)
@@ -2030,16 +2121,20 @@ exec_get_props_ctx(IgraphStmtGetProps *gp, IgraphExecContext *ctx)
                 Int64GetDatum(gp->node_id),
                 CStringGetTextDatum(ctx->table_prefix)
             };
+            char *sql = igraph_qualify_call("pg_igraph", "graph_get_node_properties($1, $2)");
             ret = SPI_execute_with_args(
-                "SELECT graph_get_node_properties($1, $2)",
+                sql,
                 2, argtypes, args, NULL, true, 1);
+            pfree(sql);
         } else {
             /* Use standard function for default tables (v1.0 compatibility) */
             Oid   argtypes[] = { INT8OID };
             Datum args[]     = { Int64GetDatum(gp->node_id) };
+            char *sql = igraph_qualify_call("pg_igraph", "graph_get_node_properties($1)");
             ret = SPI_execute_with_args(
-                "SELECT graph_get_node_properties($1)",
+                sql,
                 1, argtypes, args, NULL, true, 1);
+            pfree(sql);
         }
     }
 

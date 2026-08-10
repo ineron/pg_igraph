@@ -20,7 +20,11 @@
 #include "utils/memutils.h"
 #include "utils/array.h"
 #include "utils/jsonb.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_extension.h"
+#include "commands/extension.h"
 
 #include "igraph_query.h"
 
@@ -336,6 +340,48 @@ prepare_plans(void)
             elog(ERROR, "pg_igraph: failed to prepare plan_delete_node_row");
         SPI_keepplan(plan_delete_node_row);
     }
+}
+
+/* ================================================================
+ * Helper: resolve "schema." prefix for calling this extension's own
+ * SQL-visible functions via SPI, so internal calls don't depend on the
+ * connecting role's search_path containing the extension's install
+ * schema (reported via cross-project thread 172, pg_ipl, 2026-08-10).
+ * ================================================================ */
+static char *
+igraph_extension_schema_qualifier(const char *extname)
+{
+    Oid       extoid;
+    HeapTuple tup;
+    Oid       nspoid;
+    char     *nspname;
+
+    extoid = get_extension_oid(extname, true);
+    if (!OidIsValid(extoid))
+        return pstrdup("");
+
+    tup = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(extoid));
+    if (!HeapTupleIsValid(tup))
+        return pstrdup("");
+
+    nspoid = ((Form_pg_extension) GETSTRUCT(tup))->extnamespace;
+    ReleaseSysCache(tup);
+
+    nspname = get_namespace_name(nspoid);
+    if (nspname == NULL)
+        return pstrdup("");
+
+    return psprintf("%s.", quote_identifier(nspname));
+}
+
+/* Build "SELECT <schema-qualified funcname_and_args>" for extname's own functions. */
+static char *
+igraph_qualify_call(const char *extname, const char *funcname_and_args)
+{
+    char *schema = igraph_extension_schema_qualifier(extname);
+    char *sql    = psprintf("SELECT %s%s", schema, funcname_and_args);
+    pfree(schema);
+    return sql;
 }
 
 /* ================================================================
@@ -3155,9 +3201,13 @@ Datum graph_resolve_node(PG_FUNCTION_ARGS)
         PointerGetDatum(value_bytea)
     };
 
-    ret = SPI_execute_with_args(
-        "SELECT graph_set_property($1, $2, $3, $4)",
-        4, prop_argtypes, prop_args, NULL, false, 1);
+    {
+        char *sql = igraph_qualify_call("pg_igraph", "graph_set_property($1, $2, $3, $4)");
+        ret = SPI_execute_with_args(
+            sql,
+            4, prop_argtypes, prop_args, NULL, false, 1);
+        pfree(sql);
+    }
 
     SPI_finish();
     PG_RETURN_INT64(new_node_id);
