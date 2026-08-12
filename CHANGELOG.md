@@ -53,9 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hash-partitioned storage with covering indexes
 
 ### Performance
-- 200x+ performance improvement over recursive CTEs
-- BFS traversal: 335K nodes in ~227ms
-- Shortest path: 10K-node chain in ~49ms
+- Up to ~21.5x faster than recursive CTEs on shortest-path queries (gap widens with path length — CTE's array-based visited check is O(n²) in path length, pg_igraph scales close to linearly); ~3.3-3.6x faster on full BFS traversal. Multi-hop traversal on shallow, non-hierarchical graphs is currently slower than a plain CTE — see task tracker.
+- BFS traversal: 335,923-node tree in ~230ms (medium scale) / 6.7M-node tree in 5.88s (large scale)
+- Shortest path: 10K-node chain in ~590ms (medium scale) / 100K-node chain in 6.5s (large scale)
+
+  *(The figures originally published here — 227ms/49ms and a blanket "200x+" claim — were never measured against real benchmark runs. Corrected 2026-08-11 after a cross-project fact-check; see `benchmark.sh` for the reproducible methodology.)*
 
 ---
 

@@ -45,12 +45,12 @@ case $SCALE in
     ;;
   medium)
     CHAIN_LEN=10000
-    TREE_DEPTH=7; TREE_BRANCH=6    # ~55k nodes
+    TREE_DEPTH=7; TREE_BRANCH=6    # 335,923 nodes (verified 2026-08-11 — not ~55k)
     RANDOM_NODES=50000; RANDOM_EDGES=200000
     ;;
   large)
     CHAIN_LEN=100000
-    TREE_DEPTH=8; TREE_BRANCH=7    # ~600k nodes
+    TREE_DEPTH=8; TREE_BRANCH=7    # 6,725,601 nodes (verified 2026-08-11 — not ~600k)
     RANDOM_NODES=500000; RANDOM_EDGES=2000000
     ;;
   huge)
@@ -408,6 +408,73 @@ WHERE relname LIKE 'edges_p%'
 ORDER BY idx_scan DESC
 LIMIT 10;
 
+EOF
+
+# ── Phase 5: Recursive CTE comparison ─────────────────────────────
+# Reproduces the three numbers cited in README.md/CHANGELOG.md so they
+# stop drifting silently. Mirrors the queries used to verify those
+# numbers on 2026-08-11 (memory bank node 1522): a plain UNION recursive
+# CTE for the acyclic tree BFS, a depth-capped UNION ALL for the random
+# multi-hop BFS, and a UNION ALL with a `visited BIGINT[]` array guard
+# for the chain shortest path (the O(n^2)-in-chain-length pattern that
+# makes pg_igraph's shortest-path advantage grow with scale).
+echo "▶ Phase 5: Recursive CTE comparison (same workloads as Phase 4)"
+echo ""
+
+$PSQL << EOF
+SET search_path = $PG_SCHEMA;
+\timing on
+
+\echo '--- [CTE] BFS full tree traversal ---'
+WITH RECURSIVE bfs(id) AS (
+  SELECT (SELECT min(id) FROM nodes
+          WHERE label=(SELECT id FROM node_labels WHERE name='TreeNode'))
+  UNION
+  SELECT e.to_id
+  FROM bfs b
+  JOIN edges e ON e.from_id = b.id
+  JOIN rel_types r ON r.id = e.rel_type
+  WHERE r.name = 'TREE_EDGE' AND e.direction = TRUE
+)
+SELECT count(*) FROM bfs;
+
+\echo '--- [CTE] Shortest path: chain start-to-end ---'
+WITH RECURSIVE path(id, visited, depth) AS (
+  SELECT
+    (SELECT min(id) FROM nodes WHERE label=(SELECT id FROM node_labels WHERE name='ChainNode')),
+    ARRAY[(SELECT min(id) FROM nodes WHERE label=(SELECT id FROM node_labels WHERE name='ChainNode'))]::BIGINT[],
+    0
+  UNION ALL
+  SELECT e.to_id, p.visited || e.to_id, p.depth + 1
+  FROM path p
+  JOIN edges e ON e.from_id = p.id
+  JOIN rel_types r ON r.id = e.rel_type
+  WHERE r.name = 'CHAIN' AND e.direction = TRUE
+    AND NOT e.to_id = ANY(p.visited)
+)
+SELECT depth AS path_len FROM path
+WHERE id = (SELECT max(id) FROM nodes WHERE label=(SELECT id FROM node_labels WHERE name='ChainNode'))
+ORDER BY depth LIMIT 1;
+
+\echo '--- [CTE] BFS random: depth 5 (from most-connected node) ---'
+WITH RECURSIVE bfs(id, depth) AS (
+  SELECT s.start_id, 0
+  FROM (
+    SELECT e.from_id AS start_id FROM edges e
+    JOIN rel_types r ON r.id = e.rel_type
+    WHERE r.name = 'RANDOM' AND e.direction = TRUE
+    GROUP BY e.from_id ORDER BY count(*) DESC LIMIT 1
+  ) s
+  UNION ALL
+  SELECT e.to_id, b.depth + 1
+  FROM bfs b
+  JOIN edges e ON e.from_id = b.id
+  JOIN rel_types r ON r.id = e.rel_type
+  WHERE r.name = 'RANDOM' AND e.direction = TRUE AND b.depth < 5
+)
+SELECT count(DISTINCT id) FROM bfs;
+
+\timing off
 EOF
 
 echo ""

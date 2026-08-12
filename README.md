@@ -4,18 +4,24 @@
 
 [![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![PostgreSQL 14+](https://img.shields.io/badge/PostgreSQL-14%2B-blue.svg)](https://www.postgresql.org/)
-[![Performance](https://img.shields.io/badge/Performance-200x%20faster-green.svg)](#performance)
+[![Performance](https://img.shields.io/badge/Performance-up%20to%2021x%20faster-green.svg)](#performance)
 [![Version](https://img.shields.io/badge/Version-1.1-blue.svg)](#version-11-features)
 
 > Transform your PostgreSQL into a high-performance graph database. No external systems needed.
 
 ## 🔥 Performance That Speaks
 
-| Operation | Dataset | pg_igraph | Recursive CTE | **Improvement** |
+Measured with `./benchmark.sh` (default `medium` scale) against hand-written recursive CTEs over the same data, result counts cross-checked to match exactly. Reproducible — see `benchmark.sh`.
+
+| Operation | Dataset | pg_igraph | Recursive CTE | Result |
 |-----------|---------|-----------|---------------|-----------------|
-| BFS Traversal | 335K nodes | 227ms | 47,000ms | **🚀 207x** |
-| Shortest Path | 10K nodes | 49ms | 8,500ms | **🚀 173x** |
-| Multi-hop Query | 50K nodes | 156ms | 12,000ms | **🚀 77x** |
+| BFS full traversal | 335,923 nodes | ~230ms | ~870ms | **🚀 ~3.6x faster** |
+| Shortest path (chain) | 10,000 nodes | ~590ms | ~1.68s | **🚀 ~2.8x faster**¹ |
+| Multi-hop traversal (depth 5, random graph) | 50,000 nodes | ~207ms | ~158ms | ⚠️ ~24% **slower** — known issue² |
+
+¹ The shortest-path speedup grows with chain length rather than shrinking: at 100K nodes it's **~21.5x** (6.5s vs 2m19s), because the naive recursive-CTE cycle guard (`NOT to_id = ANY(visited)`, array grown via `||` every hop) is O(n²) in path length, while pg_igraph's bidirectional BFS scales close to linearly.
+
+² Shallow (depth-5), non-hierarchical traversals currently lose to a single-query CTE plan — likely SPI/adaptive-traversal overhead dominating for this shape. Being investigated; not yet fixed.
 
 ## ⚡ Quick Start
 
@@ -295,7 +301,7 @@ pg_igraph automatically switches between execution modes:
 - **Covering Indexes**: Three indexes per partition for optimal patterns
 
 ### Why Not Recursive CTEs?
-PostgreSQL's recursive executor materializes intermediate results and cannot maintain a visited set across iterations. On a 335K-node tree, recursive CTEs take **47 seconds** vs pg_igraph's **227ms**.
+PostgreSQL's recursive executor materializes intermediate results and cannot maintain a visited set across iterations. On a 335,923-node tree, a hand-written recursive CTE BFS takes **~870ms** vs pg_igraph's **~230ms** — and the gap widens with path length: a 100K-node chain shortest-path takes pg_igraph **6.5s** vs the CTE's **2m19s** (~21.5x), since the CTE's array-based visited check is O(n²) in path length.
 
 ## 📄 License
 
